@@ -1,4 +1,5 @@
-import { stat } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
+import type { Stats } from "node:fs";
 
 /** True if `err` is a Node "file not found" error - used by every read path
  * in this project that treats a missing file as "nothing recorded yet"
@@ -7,15 +8,15 @@ export function isEnoent(err: unknown): boolean {
   return err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT";
 }
 
-/** True if something - file or directory - is at `filePath`. Only "not
- * found" reads as false; any other failure is rethrown. */
-export async function fileExists(filePath: string): Promise<boolean> {
+/** What is at `filePath` - file, directory, or a symlink itself (dangling or
+ * not; links aren't followed) - or undefined if nothing is. Only "not found"
+ * reads as undefined; any other failure is rethrown. */
+export async function lstatIfPresent(filePath: string): Promise<Stats | undefined> {
   try {
-    await stat(filePath);
-    return true;
+    return await lstat(filePath);
   } catch (cause) {
     if (isEnoent(cause)) {
-      return false;
+      return undefined;
     }
     throw cause;
   }

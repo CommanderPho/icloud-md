@@ -763,7 +763,14 @@ export async function renameForRemoteTitle(
   // renamed away from.
   usedInDir.delete(currentName);
 
-  const wanted = await claimFreeFileName(path.join(targetDir, dir), noteFileNameFor(titleLine, titleMode), usedInDir);
+  // The current file is passed as our own, so a case-only retitle on a
+  // case-insensitive filesystem doesn't read as colliding with itself.
+  const wanted = await claimFreeFileName(
+    path.join(targetDir, dir),
+    noteFileNameFor(titleLine, titleMode),
+    usedInDir,
+    path.join(targetDir, currentFile),
+  );
 
   if (defer) {
     // The old name is still occupied - by this very file, which isn't going

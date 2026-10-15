@@ -61,11 +61,14 @@ export async function reconcileNotePlacements(
     const fromFile = entry.file;
     // Claimed names only cover tracked notes; the disk check keeps the move
     // from landing on an untracked file the user created in the target
-    // directory (rename() would replace it without a word).
+    // directory (rename() would replace it without a word). Passing the
+    // source keeps a case-only folder rename from colliding with itself.
+    const targetNames = names(claimedNames, move.toDir);
     const baseName = await claimFreeFileName(
       path.join(targetDir, move.toDir),
       path.posix.basename(fromFile),
-      names(claimedNames, move.toDir),
+      targetNames,
+      path.join(targetDir, fromFile),
     );
     const toFile = path.posix.join(move.toDir, baseName);
 
@@ -73,7 +76,7 @@ export async function reconcileNotePlacements(
     if (!(await tryRename(path.join(targetDir, fromFile), path.join(targetDir, toFile)))) {
       // Missing locally (deleted or moved by hand); leave tracking at the
       // old path - push/status own that conversation.
-      names(claimedNames, move.toDir).delete(baseName);
+      targetNames.delete(baseName);
       claim(claimedNames, noteDirOf(fromFile), path.posix.basename(fromFile));
       continue;
     }

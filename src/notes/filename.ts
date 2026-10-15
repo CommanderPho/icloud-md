@@ -1,5 +1,5 @@
 import path from "node:path";
-import { fileExists } from "../fsUtil.js";
+import { lstatIfPresent } from "../fsUtil.js";
 import { carriedTitleSpelling, encodeTitleStem, titleIsRepresentable } from "./titleFilename.js";
 
 /**
@@ -130,10 +130,28 @@ export function uniqueFileName(fileName: string, usedFileNames: ReadonlySet<stri
  * a plain `writeFile`/`rename` onto its name destroys it. Names found taken on
  * disk are claimed too, so later calls in the same run skip them without
  * another stat.
+ *
+ * `ownPath` is the file being moved or renamed, when there is one. A
+ * candidate that turns out to *be* that file isn't taken: on a
+ * case-insensitive filesystem (APFS, NTFS) a case-only change - folder
+ * "recipes" retitled "Recipes", note "groceries" retitled "Groceries" -
+ * resolves the new name to the very file being moved, and counting that as
+ * a collision would give it a needless " 2" suffix. Identity is device plus
+ * inode, so the check doesn't need to know how the filesystem folds case.
  */
-export async function claimFreeFileName(dirPath: string, fileName: string, usedFileNames: Set<string>): Promise<string> {
+export async function claimFreeFileName(
+  dirPath: string,
+  fileName: string,
+  usedFileNames: Set<string>,
+  ownPath?: string,
+): Promise<string> {
+  const own = ownPath === undefined ? undefined : await lstatIfPresent(ownPath);
   let candidate = uniqueFileName(fileName, usedFileNames);
-  while (await fileExists(path.join(dirPath, candidate))) {
+  for (;;) {
+    const found = await lstatIfPresent(path.join(dirPath, candidate));
+    if (found === undefined || (own !== undefined && found.dev === own.dev && found.ino === own.ino)) {
+      break;
+    }
     usedFileNames.add(candidate);
     candidate = uniqueFileName(fileName, usedFileNames);
   }

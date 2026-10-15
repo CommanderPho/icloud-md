@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -48,6 +48,35 @@ test("claimFreeFileName skips names taken on disk as well as claimed ones, and c
 
     assert.equal(await claimFreeFileName(dir, "New Note.md", used), "New Note 4.md");
     assert.deepEqual([...used].sort(), ["New Note 2.md", "New Note 3.md", "New Note 4.md", "New Note.md"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claimFreeFileName treats a dangling symlink as taken", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "filename-test-"));
+  try {
+    // stat() would follow it and see nothing; writing through it would
+    // create a file wherever it points.
+    await symlink(path.join(dir, "nowhere.md"), path.join(dir, "New Note.md"));
+
+    assert.equal(await claimFreeFileName(dir, "New Note.md", new Set()), "New Note 2.md");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("claimFreeFileName lets a candidate that is the file being moved through, and nothing else", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "filename-test-"));
+  try {
+    // A hard link stands in for a case-insensitive filesystem, where
+    // "Pie.md" and "pie.md" are one file.
+    await writeFile(path.join(dir, "pie.md"), "moving", "utf-8");
+    await link(path.join(dir, "pie.md"), path.join(dir, "Pie.md"));
+    await writeFile(path.join(dir, "other.md"), "someone else", "utf-8");
+
+    assert.equal(await claimFreeFileName(dir, "Pie.md", new Set(), path.join(dir, "pie.md")), "Pie.md");
+    assert.equal(await claimFreeFileName(dir, "Pie.md", new Set(), path.join(dir, "other.md")), "Pie 2.md");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
