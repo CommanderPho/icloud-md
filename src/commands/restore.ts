@@ -3,6 +3,7 @@ import path from "node:path";
 import { readBaseCopy } from "../notes/baseCopy.js";
 import { openVault } from "../notes/vaultMigrations.js";
 import { joinFrontmatter, splitFrontmatter } from "../notes/frontmatter.js";
+import { composeNoteFile } from "../notes/noteIdFrontmatter.js";
 import { isEnoent } from "../fsUtil.js";
 import { resolveTrackedNote } from "../notes/trackedFile.js";
 import { NotClonedDirectoryError } from "../errors.js";
@@ -39,17 +40,20 @@ export async function runRestore(targetDir: string, fileArg: string): Promise<Re
   }
 
   // A deleted working file is a supported restore target (arguably the most
-  // useful one) and has no envelope to keep, so a missing file yields an empty
-  // frontmatter rather than an error - matching how `pull` handles its own
-  // "missing locally" branch.
+  // useful one) and has no envelope to keep, so it gets a fresh one the way
+  // `pull` writes its own "missing locally" branch: the note's id, plus the
+  // `apple-note-title` the last sync recorded. Without the key, `push` would
+  // read its absence as a request to retitle the note to its file name.
   const filePath = path.join(targetDir, entry.file);
-  let existing = "";
+  let existing: string;
   try {
     existing = await readFile(filePath, "utf-8");
   } catch (cause) {
     if (!isEnoent(cause)) {
       throw cause;
     }
+    await writeFile(filePath, composeNoteFile("", base, recordName, entry.frontmatterTitle), "utf-8");
+    return { file: entry.file };
   }
 
   // Split with the vault's shape in mind: under filename-as-title the body

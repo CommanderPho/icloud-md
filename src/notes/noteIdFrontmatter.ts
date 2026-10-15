@@ -163,6 +163,35 @@ export function readNoteTitle(frontmatter: string): string | undefined {
   return value;
 }
 
+/**
+ * What an envelope says about `apple-note-title`, for a caller that has to
+ * tell a key that's *gone* from one it merely can't read - which
+ * `readNoteTitle` deliberately folds together.
+ *
+ *  - `stated`: the key is there with a usable title.
+ *  - `absent`: the envelope parsed (or there is none) and has no such key -
+ *    a removal, if the key used to be there.
+ *  - `unreadable`: the envelope doesn't parse, or the key holds something
+ *    that isn't a title (empty, not a string). A file someone is part-way
+ *    through editing, which must never be read as an instruction.
+ */
+export type NoteTitleKey = { kind: "stated"; title: string } | { kind: "absent" } | { kind: "unreadable" };
+
+export function readNoteTitleKey(frontmatter: string): NoteTitleKey {
+  if (frontmatter.trim() === "") {
+    return { kind: "absent" };
+  }
+  const doc = parseFrontmatterDocument(frontmatter);
+  if (!doc) {
+    return { kind: "unreadable" };
+  }
+  if (!doc.has(NOTE_TITLE_KEY)) {
+    return { kind: "absent" };
+  }
+  const value: unknown = doc.get(NOTE_TITLE_KEY);
+  return typeof value === "string" && value !== "" ? { kind: "stated", title: value } : { kind: "unreadable" };
+}
+
 /** Returns `frontmatter` with `apple-note-title` set, creating the envelope
  * if there was none. Unchanged when it already says exactly this. */
 export function setNoteTitle(frontmatter: string, title: string): string {

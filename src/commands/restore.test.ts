@@ -80,6 +80,26 @@ test("restore recreates a missing file from the base copy, with no frontmatter",
     assert.equal(await readFile(path.join(dir, "Test Note.md"), "utf-8"), "Original synced text");
   }));
 
+test("restore recreates a missing file with its id and the apple-note-title the last sync recorded", () =>
+  withTempDir(async (dir) => {
+    // Without the key, push would read its absence as a request to retitle
+    // the note to its file name - "Untitled", for a note filed that way.
+    const id = "5B1A2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D";
+    await writeCloneState(dir, {
+      syncToken: "token",
+      titleMode: "filename",
+      notes: { [id]: { file: "Untitled.md", recordChangeTag: "1a", modificationDate: 100, frontmatterTitle: "Restaurants " } },
+    });
+    await writeBaseCopy(dir, id, "Original synced text");
+
+    await runRestore(dir, "Untitled.md");
+
+    assert.equal(
+      await readFile(path.join(dir, "Untitled.md"), "utf-8"),
+      `---\napple-note-id: ${id}\napple-note-title: "Restaurants "\n---\n\nOriginal synced text`,
+    );
+  }));
+
 test("restore leaves a frontmatter-only file as envelope plus base copy", () =>
   withTempDir(async (dir) => {
     await writeCloneState(dir, STATE);

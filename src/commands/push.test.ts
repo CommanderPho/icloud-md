@@ -7,7 +7,7 @@ import { readBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
 import { writeCloneState, type CloneState } from "../notes/cloneState.js";
 import { localFileState } from "../notes/localFileState.js";
 import { NotClonedDirectoryError, UnboundAccountError } from "../errors.js";
-import { buildPushPlan, planRemoteChangedMerge, runPush } from "./push.js";
+import { buildPushPlan, planRemoteChangedMerge, runPush, titleKeyIntent } from "./push.js";
 
 async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), "push-test-"));
@@ -292,12 +292,13 @@ test("buildPushPlan defers a shared note's title-only refusal to the live record
     await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
   }));
 
-test("buildPushPlan reads a removed apple-note-title as a retitle to the file name - refused for an individually-shared note", () =>
+test("buildPushPlan defers a shared note's removed apple-note-title to the live title rather than refusing it outright", () =>
   withTempDir(async (dir) => {
     // Deleting the key is the only way to drop a title pull had to write
     // out. It used to be skipped as "states no title", so there was no way
-    // to ask for the name's title instead; the shared-note refusal proves
-    // the plan now reads the removal as a retitle.
+    // to ask for the name's title instead. On a shared note the removal may
+    // ask for the title the note already has (a redundant key), so the
+    // refusal waits for the live comparison - which needs the network.
     const shared = { ...emptyState(), titleMode: "filename" as const };
     shared.notes = {
       LOOSE1: {
@@ -312,12 +313,106 @@ test("buildPushPlan reads a removed apple-note-title as a retitle to the file na
     await writeBaseCopy(dir, "LOOSE1", "Hello");
     await writeVaultFile(dir, "Pat/Untitled.md", "---\napple-note-id: LOOSE1\n---\n\nHello");
 
+    await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
+  }));
+
+test("buildPushPlan doesn't read an apple-note-title it can't parse as a removal", () =>
+  withTempDir(async (dir) => {
+    // Broken YAML is a file someone is part-way through editing, and an
+    // empty key isn't a title: neither may retitle the note to "Untitled".
+    for (const envelope of ["---\ntags: [a\n---\n\n", '---\napple-note-title: ""\n---\n\n']) {
+      const own = { ...emptyState(), titleMode: "filename" as const };
+      own.notes = {
+        REC1: {
+          file: "Notes/Untitled.md",
+          recordChangeTag: "1a",
+          modificationDate: 100,
+          folderRecordName: "DefaultFolder-CloudKit",
+          frontmatterTitle: "Restaurants ",
+        },
+      };
+      await writeCloneState(dir, own);
+      await writeBaseCopy(dir, "REC1", "Hello");
+      await writeVaultFile(dir, "Notes/Untitled.md", `${envelope}Hello`);
+
+      const { entries } = await buildPushPlan(dir);
+
+      assert.deepEqual(entries, [], envelope);
+    }
+  }));
+
+test("buildPushPlan refuses a removed apple-note-title when the file name may carry pull's collision number", () =>
+  withTempDir(async (dir) => {
+    // "Untitled 2.md" is the second note pull couldn't name; removing its key
+    // must not title the note "Untitled 2".
+    const own = { ...emptyState(), titleMode: "filename" as const };
+    own.notes = {
+      REC1: {
+        file: "Notes/Untitled 2.md",
+        recordChangeTag: "1a",
+        modificationDate: 100,
+        folderRecordName: "DefaultFolder-CloudKit",
+        frontmatterTitle: "Restaurants ",
+      },
+    };
+    await writeCloneState(dir, own);
+    await writeBaseCopy(dir, "REC1", "Hello");
+    await writeVaultFile(dir, "Notes/Untitled 2.md", "Hello");
+
     const { entries } = await buildPushPlan(dir);
 
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.resolution, "refused");
-    assert.match(entries[0]?.reason ?? "", /individually-shared/);
+    assert.match(entries[0]?.reason ?? "", /"Untitled 2" may carry a number pull added/);
   }));
+
+test("buildPushPlan refuses a moved note whose removed apple-note-title would leave a numbered name as its title", () =>
+  withTempDir(async (dir) => {
+    const id = "5B1A2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D";
+    const own = { ...emptyState(), titleMode: "filename" as const };
+    own.notes = {
+      [id]: {
+        file: "Notes/Untitled 2.md",
+        recordChangeTag: "1a",
+        modificationDate: 100,
+        folderRecordName: "DefaultFolder-CloudKit",
+        frontmatterTitle: "Restaurants ",
+      },
+    };
+    await writeCloneState(dir, own);
+    await writeBaseCopy(dir, id, "Hello");
+    await writeVaultFile(dir, "Recipes/Untitled 2.md", `---\napple-note-id: ${id}\n---\n\nHello`);
+
+    const { entries } = await buildPushPlan(dir);
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.kind, "move");
+    assert.equal(entries[0]?.resolution, "refused");
+    assert.match(entries[0]?.reason ?? "", /may carry a number pull added/);
+  }));
+
+test("titleKeyIntent: what state records once a note's apple-note-title is settled", () => {
+  const entry = { file: "Notes/Untitled.md", recordChangeTag: "1a", modificationDate: 100, frontmatterTitle: "Restaurants " };
+
+  // A removed key asks for the name's title, and is recorded as removed -
+  // otherwise every later plan would read the removal as a request again.
+  assert.deepEqual(titleKeyIntent("---\napple-note-id: X\n---\n\n", entry, true), {
+    requestedTitle: "Untitled",
+    recordedTitle: undefined,
+  });
+  assert.deepEqual(titleKeyIntent("", entry, true), { requestedTitle: "Untitled", recordedTitle: undefined });
+  // A stated key is both the request and the record.
+  assert.deepEqual(titleKeyIntent('---\napple-note-title: "Other "\n---\n\n', entry, true), {
+    requestedTitle: "Other ",
+    recordedTitle: "Other ",
+  });
+  // An unreadable key asks nothing and keeps state's record.
+  assert.deepEqual(titleKeyIntent("---\ntags: [a\n---\n\n", entry, true), { recordedTitle: "Restaurants " });
+  // A note that never had a key has nothing to remove.
+  assert.deepEqual(titleKeyIntent("", { ...entry, frontmatterTitle: undefined }, true), { recordedTitle: undefined });
+  // An in-body vault never reads the key.
+  assert.deepEqual(titleKeyIntent("", entry, false), { recordedTitle: "Restaurants " });
+});
 
 test("buildPushPlan takes a removed apple-note-title on an own note to the network as a retitle", () =>
   withTempDir(async (dir) => {
@@ -389,25 +484,32 @@ test("buildPushPlan warns about a note put inside an attachments directory inste
 
     const { entries, notices } = await buildPushPlan(dir);
 
-    // Still never pushed - only reported.
+    // Still never pushed - only reported, in one notice.
     assert.deepEqual(entries, []);
     assert.deepEqual(
       notices.map((notice) => notice.level),
-      ["warn", "warn"],
+      ["warn"],
     );
-    assert.match(notices[0]?.message ?? "", /^Notes\/attachments\/Stray\.md is inside an "attachments" directory/);
-    assert.match(notices[1]?.message ?? "", /^Notes\/attachments\/deeper\/Also Stray\.md /);
+    assert.match(
+      notices[0]?.message ?? "",
+      /^2 markdown files are inside an "attachments" directory.*: Notes\/attachments\/Stray\.md, Notes\/attachments\/deeper\/Also Stray\.md$/,
+    );
   }));
 
-test("buildPushPlan doesn't warn about a markdown file that is a note's tracked attachment", () =>
+test("buildPushPlan doesn't warn about a markdown file the clone already tracks under attachments/", () =>
   withTempDir(async (dir) => {
     await writeCloneState(dir, {
       ...emptyState(),
       attachments: {
         ATT1: { file: "Notes/attachments/readme.md", mediaRecordName: "MEDIA1", mediaFileChecksum: "c", noteRecordName: "REC1" },
       },
+      notes: {
+        REC2: { file: "Old/Attachments/Kept.md", recordChangeTag: "1a", modificationDate: 100, folderRecordName: "F-OLD" },
+      },
     });
+    await writeBaseCopy(dir, "REC2", "a note from an older layout");
     await writeVaultFile(dir, "Notes/attachments/readme.md", "an attached markdown file");
+    await writeVaultFile(dir, "Old/Attachments/Kept.md", "a note from an older layout");
 
     const { entries, notices } = await buildPushPlan(dir);
 
