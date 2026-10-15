@@ -254,18 +254,36 @@ export async function runPull(
         }
 
         const existing = notes[record.recordName];
+        const decoded = classifyNoteRecord(record, { titleMode });
 
         // A resynced zone re-delivers *every* record, changed or not. One
         // whose change tag still matches what this vault last synced hasn't
         // moved remotely - skip it, exactly as an incremental fetch would
         // have by never sending it. (A record with local-only edits is
         // untouched either way: not rewriting it here is what an incremental
-        // pull already does, and `push` picks the edits up as usual.)
-        if (source.resynced && existing !== undefined && record.recordChangeTag !== undefined && record.recordChangeTag === existing.recordChangeTag) {
+        // pull already does, and `push` picks the edits up as usual.) The
+        // tag alone isn't quite enough, though: `push` and `status` can
+        // advance it without catching up the rest of the entry (see
+        // `trackedEntryMatches`), and this re-delivery is the one chance to.
+        if (
+          source.resynced &&
+          existing !== undefined &&
+          record.recordChangeTag !== undefined &&
+          record.recordChangeTag === existing.recordChangeTag &&
+          (decoded.status !== "ok" ||
+            trackedEntryMatches(
+              existing,
+              {
+                titleLine: decoded.titleLine,
+                folderRecordName: placeNote(layout, record, source.sharedZoneOwner).folderRecordName,
+                frontmatterTitle: titleNeedingFrontmatter(decoded.titleLine, titleMode),
+                unpublishableReason: decoded.unpublishableReason,
+              },
+              titleMode,
+            ))
+        ) {
           continue;
         }
-
-        const decoded = classifyNoteRecord(record, { titleMode });
 
         if (decoded.status === "deleted") {
           // A note this tool soft-deleted stays in the trash registry until
@@ -371,6 +389,7 @@ export async function runPull(
               frontmatterTitle: recordedTitle,
               unpublishableReason: decoded.unpublishableReason,
             },
+            decoded.embedSlots.length === 0 ? decoded.markdownText : undefined,
             titleMode,
             tableAttachments,
           ))
@@ -743,31 +762,18 @@ export interface DerivedNoteFields {
 }
 
 /**
- * Whether applying a delivered record would only rewrite what this vault
- * already holds: its change tag is the one tracked, and nothing else a pull
- * would derive from it differs from the tracked entry.
+ * Whether a note's tracked entry already says everything a pull would derive
+ * from its record besides the text: its folder, title, and read-only flag,
+ * with no rename left pending.
  *
- * The tag alone isn't enough. `push` - and `status`, which plans a push -
- * can adopt a remote change by merging its text and advancing the tag,
- * without ever updating the folder, the title, or the read-only flag that
- * came with it. Until now the re-delivery of that record is what caught
- * those up, so a record whose derived fields disagree with the entry goes
- * through the normal path. So does one whose file is missing (pull
- * recreates it), one with a rename still pending, and one with tables: their
- * snapshots are taken while resolving the attachments, and `push` doesn't
- * record the table bytes it uploads either.
+ * A matching change tag doesn't guarantee this. `push` - and `status`, which
+ * plans a push - can adopt a remote change by merging its text and advancing
+ * the tag, without ever updating the folder, the title, or the read-only
+ * flag that came with it. The re-delivery of that record is what catches
+ * those up, so it mustn't be skipped. `modificationDate` is left out on
+ * purpose: the same adoption leaves it stale, but nothing reads it back.
  */
-export async function isAlreadyAtTrackedVersion(
-  targetDir: string,
-  record: CloudKitRecord,
-  existing: CloneStateNoteEntry,
-  derived: DerivedNoteFields,
-  titleMode: TitleMode,
-  tableAttachments: NonNullable<CloneState["tableAttachments"]>,
-): Promise<boolean> {
-  if (record.recordChangeTag === undefined || record.recordChangeTag !== existing.recordChangeTag) {
-    return false;
-  }
+export function trackedEntryMatches(existing: CloneStateNoteEntry, derived: DerivedNoteFields, titleMode: TitleMode): boolean {
   if (
     derived.folderRecordName !== existing.folderRecordName ||
     derived.frontmatterTitle !== existing.frontmatterTitle ||
@@ -776,13 +782,61 @@ export async function isAlreadyAtTrackedVersion(
   ) {
     return false;
   }
-  if (titleMode === "filename" && !fileNameCarriesTitle(path.posix.basename(existing.file), derived.titleLine)) {
+  return titleMode !== "filename" || fileNameCarriesTitle(path.posix.basename(existing.file), derived.titleLine);
+}
+
+/**
+ * Whether applying a delivered record would only rewrite what this vault
+ * already holds: its change tag is the one tracked, the entry matches (see
+ * `trackedEntryMatches`), and the base copy is already pull's own rendering
+ * of the record.
+ *
+ * That last check is the one `push` makes necessary. It writes the text the
+ * user typed as the base copy, and pull's rendering of the same note can
+ * differ cosmetically (`* item` against `- item`). The re-delivery right
+ * after a push is what replaced that base with pull's rendering; skip it,
+ * and the next remote edit diffs against a base in the wrong notation and
+ * conflicts on lines nobody touched. `renderedBody` is undefined when the
+ * record has embeds, since rendering those means resolving attachments, so
+ * such a record always takes the normal path.
+ *
+ * Also never skipped: a missing file (pull recreates it), a file still
+ * carrying conflict markers (pull is where those are reported), and a note
+ * with tables, whose snapshots are taken while resolving the attachments -
+ * `push` doesn't record the table bytes it uploads either.
+ */
+export async function isAlreadyAtTrackedVersion(
+  targetDir: string,
+  record: CloudKitRecord,
+  existing: CloneStateNoteEntry,
+  derived: DerivedNoteFields,
+  renderedBody: string | undefined,
+  titleMode: TitleMode,
+  tableAttachments: NonNullable<CloneState["tableAttachments"]>,
+): Promise<boolean> {
+  if (record.recordChangeTag === undefined || record.recordChangeTag !== existing.recordChangeTag) {
+    return false;
+  }
+  if (!trackedEntryMatches(existing, derived, titleMode)) {
     return false;
   }
   if (Object.values(tableAttachments).some((entry) => entry.noteRecordName === record.recordName)) {
     return false;
   }
-  return (await localFileState(targetDir, existing, record.recordName, titleMode)) !== "missing";
+  if (renderedBody === undefined || (await readBaseCopy(targetDir, record.recordName)) !== renderedBody) {
+    return false;
+  }
+  const local = await localFileState(targetDir, existing, record.recordName, titleMode);
+  if (local === "missing") {
+    return false;
+  }
+  if (local === "modified") {
+    const { body } = splitFrontmatter(await readFile(path.join(targetDir, existing.file), "utf-8"), {
+      filenameAsTitle: titleMode === "filename",
+    });
+    return !hasConflictMarkers(body);
+  }
+  return true;
 }
 
 /**
