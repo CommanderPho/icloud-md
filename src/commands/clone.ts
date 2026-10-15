@@ -96,14 +96,13 @@ export async function runClone(
     undefined,
     onPage,
   );
-  const { zones: sharedZones, skippedZones } = await fetchSharedNoteRecords(
-    auth.session,
-    auth.ckdatabasewsUrl,
-    auth.dsid,
-    {},
-    onPage,
-  );
-  const heldBack = await backfillNewPrivateNoteBodies(auth.session, auth.ckdatabasewsUrl, auth.dsid, records, {});
+  // The private lookup only needs the private walk, so it runs alongside the
+  // shared fetch rather than after it.
+  const [{ zones: sharedZones, skippedZones }, privateBackfill] = await Promise.all([
+    fetchSharedNoteRecords(auth.session, auth.ckdatabasewsUrl, auth.dsid, {}, onPage),
+    backfillNewPrivateNoteBodies(auth.session, auth.ckdatabasewsUrl, auth.dsid, records, {}),
+  ]);
+  const heldBack = new Set(privateBackfill.heldBack);
 
   const summary: CloneSummary = {
     written: 0,
@@ -126,12 +125,14 @@ export async function runClone(
             "fill it in - no notes from it were cloned; the first pull will retry it",
     });
   }
-  if (heldBack.length > 0) {
+  if (heldBack.size > 0) {
+    const why =
+      privateBackfill.lookupError === undefined
+        ? "came through without their text, even when looked up"
+        : `came through without their text, and looking them up failed (${privateBackfill.lookupError})`;
     summary.notices.push({
       level: "warn",
-      message:
-        `${heldBack.length} note(s) came through without their text, even when looked up - they weren't cloned; ` +
-        "the first pull will look for them again",
+      message: `${heldBack.size} note(s) ${why} - they weren't cloned; the first pull will look for them again`,
     });
   }
   const notes: CloneState["notes"] = {};
@@ -177,7 +178,10 @@ export async function runClone(
           continue;
         }
         if (decoded.status === "unsyncable") {
-          summary.skippedUndecodable += 1;
+          // A held-back note is only waiting, and has its own notice.
+          if (!heldBack.has(record.recordName)) {
+            summary.skippedUndecodable += 1;
+          }
           continue;
         }
 
@@ -258,7 +262,7 @@ export async function runClone(
     // No token while notes are held back: the first pull then walks the zone
     // from scratch and is delivered them again (along with every other note,
     // re-applied unchanged).
-    syncToken: heldBack.length > 0 ? undefined : syncToken,
+    syncToken: heldBack.size > 0 ? undefined : syncToken,
     sharedZoneSyncTokens,
     notes,
     folders: layout.stateFolders,

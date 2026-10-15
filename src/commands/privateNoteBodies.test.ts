@@ -86,7 +86,7 @@ test("a new private note listed without its text is looked up and filled in", as
   try {
     const records = [noteWithText("has-text"), bodylessNote("new-note")];
 
-    const heldBack = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
+    const { heldBack } = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
 
     assert.deepEqual(heldBack, []);
     assert.deepEqual(
@@ -112,11 +112,53 @@ test("a new note the lookup can't fill is returned, so the caller holds its sync
   try {
     const records = [bodylessNote("filled"), bodylessNote("still-missing")];
 
-    const heldBack = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
+    const { heldBack } = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
 
     assert.deepEqual(heldBack, ["still-missing"]);
     assert.equal(records[0]?.fields.TextDataEncrypted?.value, "Ym9keQ==");
     assert.equal(records[1]?.fields.TextDataEncrypted, undefined);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("a failed lookup holds every looked-up note back instead of failing the sync", async () => {
+  const realFetch = globalThis.fetch;
+  let lookupCalls = 0;
+  globalThis.fetch = (async (url: Parameters<typeof fetch>[0]) => {
+    const href = String(url);
+    if (href.includes("/private/records/lookup")) {
+      lookupCalls += 1;
+      return new Response("Service Unavailable", { status: 503 });
+    }
+    throw new Error(`Unexpected fetch in test: ${href}`);
+  }) as typeof fetch;
+  try {
+    const records = [noteWithText("has-text"), bodylessNote("new-a"), bodylessNote("new-b")];
+
+    const result = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
+
+    assert.equal(lookupCalls, 1);
+    assert.deepEqual(result.heldBack, ["new-a", "new-b"]);
+    assert.match(result.lookupError ?? "", /HTTP 503/);
+    assert.equal(records[1]?.fields.TextDataEncrypted, undefined);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a successful lookup reports no lookup error", async () => {
+  const mock = installFetchMock((requested) => requested.map(fullLookupEntry));
+  try {
+    const result = await backfillNewPrivateNoteBodies(
+      session,
+      "https://ckdatabasews.example",
+      "12345",
+      [bodylessNote("new-note")],
+      {},
+    );
+
+    assert.deepEqual(result, { heldBack: [] });
   } finally {
     mock.restore();
   }
@@ -136,7 +178,7 @@ test("a note whose text lives in a TextDataAsset is skipped, not held back for",
   try {
     const records = [bodylessNote("large-note")];
 
-    const heldBack = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
+    const { heldBack } = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {});
 
     assert.deepEqual(heldBack, []);
     assert.equal(mock.lookups.length, 1);
@@ -160,7 +202,7 @@ test("tracked, deleted, trashed and non-Note records are never looked up", async
       noteWithText("has-text"),
     ];
 
-    const heldBack = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {
+    const { heldBack } = await backfillNewPrivateNoteBodies(session, "https://ckdatabasews.example", "12345", records, {
       tracked: { file: "Notes/Tracked.md" },
     });
 

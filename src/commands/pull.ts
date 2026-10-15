@@ -135,15 +135,19 @@ export async function runPull(
     state.syncToken,
     onPage,
   );
-  const { zones: sharedZones, skippedZones } = await fetchSharedNoteRecords(
-    auth.session,
-    auth.ckdatabasewsUrl,
-    auth.dsid,
-    state.sharedZoneSyncTokens ?? {},
-    onPage,
-  );
-  await backfillSharePermissions(auth.session, auth.ckdatabasewsUrl, auth.dsid, state.folders ?? {}, sharedZones);
-  const heldBack = await backfillNewPrivateNoteBodies(auth.session, auth.ckdatabasewsUrl, auth.dsid, records, state.notes);
+  // The private lookup only needs the private walk, so it runs alongside the
+  // shared fetch rather than after it.
+  const ckdatabasewsUrl = auth.ckdatabasewsUrl;
+  const [{ zones: sharedZones, skippedZones }, privateBackfill] = await Promise.all([
+    fetchSharedNoteRecords(auth.session, ckdatabasewsUrl, auth.dsid, state.sharedZoneSyncTokens ?? {}, onPage).then(
+      async (shared) => {
+        await backfillSharePermissions(auth.session, ckdatabasewsUrl, auth.dsid, state.folders ?? {}, shared.zones);
+        return shared;
+      },
+    ),
+    backfillNewPrivateNoteBodies(auth.session, ckdatabasewsUrl, auth.dsid, records, state.notes),
+  ]);
+  const heldBack = new Set(privateBackfill.heldBack);
 
   const notes: CloneState["notes"] = { ...state.notes };
   const attachments: NonNullable<CloneState["attachments"]> = { ...state.attachments };
@@ -233,11 +237,15 @@ export async function runPull(
     });
   }
 
-  if (heldBack.length > 0) {
+  if (heldBack.size > 0) {
+    const why =
+      privateBackfill.lookupError === undefined
+        ? "came through without their text, even when looked up"
+        : `came through without their text, and looking them up failed (${privateBackfill.lookupError})`;
     summary.notices.push({
       level: "warn",
       message:
-        `${heldBack.length} new note(s) came through without their text, even when looked up - they were skipped, ` +
+        `${heldBack.size} new note(s) ${why} - they were skipped, ` +
         "and this vault's sync token was kept where it was so the next pull looks for them again",
     });
   }
@@ -310,7 +318,8 @@ export async function runPull(
                 level: "warn",
                 message: `${existing.file}: the server sent this note without its text this run - left unchanged and still tracked`,
               });
-            } else {
+            } else if (!heldBack.has(record.recordName)) {
+              // A held-back note is only waiting, and has its own notice.
               summary.skippedNewUnsyncable += 1;
             }
             continue;
@@ -662,7 +671,7 @@ export async function runPull(
     // comes again too and is re-applied - harmless, since the remote text is
     // what this run already wrote and recorded as the base copy, but those
     // notes show up in that pull's changes a second time.
-    syncToken: heldBack.length > 0 ? state.syncToken : syncToken,
+    syncToken: heldBack.size > 0 ? state.syncToken : syncToken,
     sharedZoneSyncTokens,
     // Carried through untouched - omitting this here used to silently wipe
     // the vault's replica identity on every pull, forcing the next push to
