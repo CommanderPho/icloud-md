@@ -129,8 +129,14 @@ interface PushCandidate {
   frontmatter: string;
   /** `apple-note-title` from that envelope, in a filename-as-title vault:
    * the title the file asks this note to have. Undefined whenever the file
-   * states none, which is the common case - the file name says it instead. */
+   * states none, which is the common case - the file name says it instead -
+   * except when the file has just dropped a key the last sync recorded:
+   * then it's the file name's title, which the removal asks for. */
   requestedTitle?: string | undefined;
+  /** The `apple-note-title` the file actually carries - what state records
+   * as `frontmatterTitle` once the title is settled, so a removed key leaves
+   * nothing behind to be read as a request again. */
+  statedTitle?: string | undefined;
   /** The body matches the base copy - this is a candidate solely because its
    * `apple-note-title` isn't the one state recorded, so the plan may settle
    * it against the live title alone (and refuse a shared note only if a
@@ -271,7 +277,19 @@ export async function buildPushPlan(
      * can't hold - where it outranks the name as the note's real title. */
     noteTitle?: string | undefined;
   }[] = [];
-  for (const file of await listUntrackedMarkdownFiles(targetDir, state)) {
+  const markdownFiles = await listUntrackedMarkdownFiles(targetDir, state);
+  // `attachments/` is reserved for attachment files, so a note put there is
+  // never pushed - but it shouldn't look, from status or push, as though it
+  // had been.
+  for (const file of markdownFiles.inAttachmentDirs) {
+    notices.push({
+      level: "warn",
+      message:
+        `${file} is inside an "attachments" directory, which holds attachment files only, so it isn't pushed - ` +
+        "move it to another folder to sync it as a note",
+    });
+  }
+  for (const file of markdownFiles.files) {
     // Body only for the note itself: an untracked file's local-only
     // frontmatter never reaches parse/create or move-matching (which
     // compares against body-only base copies). The envelope is still read
@@ -312,9 +330,16 @@ export async function buildPushPlan(
     // which is the only non-lossy comparison there is. In an in-body vault
     // the title is the first line and the key would be a second source of
     // truth, so it isn't read at all.
-    const requestedTitle = filenameAsTitle ? readNoteTitle(frontmatter) : undefined;
+    //
+    // A key the last sync recorded but the file no longer has was removed,
+    // and removing it asks for the title the file name spells - otherwise
+    // there'd be no way to drop a title pull had to write out (one a name
+    // can't hold) in favor of one it can.
+    const statedTitle = filenameAsTitle ? readNoteTitle(frontmatter) : undefined;
+    const requestedTitle =
+      statedTitle ?? (filenameAsTitle && entry.frontmatterTitle !== undefined ? titleFromNoteFileName(entry.file) : undefined);
     const titleOnly = local.status === "clean";
-    if (titleOnly && (requestedTitle === undefined || requestedTitle === entry.frontmatterTitle)) {
+    if (titleOnly && (requestedTitle === undefined || (statedTitle !== undefined && statedTitle === entry.frontmatterTitle))) {
       continue;
     }
 
@@ -381,7 +406,7 @@ export async function buildPushPlan(
       });
       continue;
     }
-    updateCandidates.push({ recordName, entry, localText, frontmatter, requestedTitle, titleOnly });
+    updateCandidates.push({ recordName, entry, localText, frontmatter, requestedTitle, statedTitle, titleOnly });
   }
 
   // --- Local-move pairing: a missing tracked file plus an untracked one
@@ -1117,7 +1142,7 @@ export async function buildPushPlan(
   }
 
   for (const candidate of updateCandidates) {
-    const { recordName, entry, localText, frontmatter, requestedTitle } = candidate;
+    const { recordName, entry, localText, frontmatter, requestedTitle, statedTitle } = candidate;
     const record = recordsByName.get(recordName);
     if (!record || record.deleted === true) {
       entries.push({
@@ -1181,11 +1206,13 @@ export async function buildPushPlan(
     // title settles which: when they agree, the key was never an edit -
     // remember that in state so the next plan doesn't need this fetch - and
     // when they differ, a shared note's refusal applies now, to the retitle
-    // it actually is.
+    // it actually is. What's remembered is the key as the file has it, so a
+    // removed key that asked for the title the note already has is settled
+    // as removed.
     if (candidate.titleOnly) {
       const classified = classifyNoteRecord(record, { titleMode });
       if (classified.status === "ok" && requestedRetitle(classified, requestedTitle) === undefined) {
-        state.notes[recordName] = { ...entry, frontmatterTitle: requestedTitle };
+        state.notes[recordName] = { ...entry, frontmatterTitle: statedTitle };
         planningMutatedState = true;
         continue;
       }
@@ -1288,7 +1315,9 @@ export async function buildPushPlan(
               // The file's `apple-note-title` (when it has one) is now the
               // note's title as far as the server is concerned - record it so
               // the next plan reads the key as synced, not as a fresh request.
-              ...(requestedTitle !== undefined ? { frontmatterTitle: requestedTitle } : {}),
+              // A key the file dropped is dropped from state too, or the
+              // removal would read as a request on every later plan.
+              ...(filenameAsTitle ? { frontmatterTitle: statedTitle } : {}),
             };
             await applyNoteFileTimes(path.join(targetDir, entry.file), noteResult.record);
           }
@@ -1425,10 +1454,41 @@ export async function runPush(targetDir: string, options: PushOptions = {}): Pro
  * POSIX paths - the raw material for the create half, the local-move
  * pairing, and the loose-file/unknown-folder refusals. Skips
  * dot-directories (the state dir, .git) and the reserved per-folder
- * `attachments/` directories. */
-async function listUntrackedMarkdownFiles(targetDir: string, state: CloneState): Promise<string[]> {
+ * `attachments/` directories; `.md` files found in the latter are returned
+ * separately, so the plan can say they're being ignored rather than skip
+ * them in silence. A `.md` that is itself a tracked attachment (a markdown
+ * file attached to a note) belongs there and isn't reported. */
+async function listUntrackedMarkdownFiles(
+  targetDir: string,
+  state: CloneState,
+): Promise<{ files: string[]; inAttachmentDirs: string[] }> {
   const tracked = new Set(Object.values(state.notes).map((entry) => entry.file));
+  const trackedAttachments = new Set(Object.values(state.attachments ?? {}).map((attachment) => attachment.file));
   const found: string[] = [];
+  const inAttachmentDirs: string[] = [];
+
+  const walkAttachments = async (dir: string): Promise<void> => {
+    let dirents;
+    try {
+      dirents = await readdir(path.join(targetDir, dir), { withFileTypes: true });
+    } catch (cause) {
+      if (isEnoent(cause)) {
+        return;
+      }
+      throw cause;
+    }
+    for (const dirent of dirents) {
+      if (dirent.name.startsWith(".")) {
+        continue;
+      }
+      const relative = `${dir}/${dirent.name}`;
+      if (dirent.isDirectory()) {
+        await walkAttachments(relative);
+      } else if (dirent.isFile() && dirent.name.endsWith(".md") && !trackedAttachments.has(relative)) {
+        inAttachmentDirs.push(relative);
+      }
+    }
+  };
 
   const walk = async (dir: string): Promise<void> => {
     let dirents;
@@ -1448,6 +1508,8 @@ async function listUntrackedMarkdownFiles(targetDir: string, state: CloneState):
       if (dirent.isDirectory()) {
         if (dirent.name.toLowerCase() !== "attachments") {
           await walk(relative);
+        } else {
+          await walkAttachments(relative);
         }
       } else if (dirent.isFile() && dirent.name.endsWith(".md") && !tracked.has(relative)) {
         found.push(relative);
@@ -1456,7 +1518,7 @@ async function listUntrackedMarkdownFiles(targetDir: string, state: CloneState):
   };
 
   await walk("");
-  return found.sort();
+  return { files: found.sort(), inAttachmentDirs: inAttachmentDirs.sort() };
 }
 
 /**

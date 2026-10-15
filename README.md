@@ -293,7 +293,9 @@ resolution live.
 - **Attachments** (images and audio confirmed): downloaded and rewritten
   into note text as `attachments/`-relative links (attachments live
   alongside the note in its own folder); re-downloaded only when the
-  remote file's checksum actually changes.
+  remote file's checksum actually changes. An `attachments/` directory is
+  reserved for them, so a note saved inside one is never pushed; `status`
+  and `push` warn about it.
 - **Table edits.** Cell edits, and inserting/deleting a contiguous run of
   rows or columns, round-trip both ways. Row/column *reordering*, and any
   edit that adds/removes rows and columns in the same save, are refused
@@ -360,7 +362,9 @@ A few consequences worth knowing before you pick:
   note asks for that title, which is the only way to give a note a title no
   file name could spell. `push` sends the retitle; the file itself is
   renamed on the next `pull`, which then drops the key again if the new
-  title turns out to be one a name can carry after all.
+  title turns out to be one a name can carry after all. Deleting the key
+  asks for the other title: the one the file name spells, so an
+  `Untitled.md` whose key you remove becomes a note titled "Untitled".
 - **A note retitled on your phone gets its file renamed on the next
   `pull`**, since there is nowhere else for the new title to go. A retitle
   you asked for locally takes the same road, which is why renaming is always
