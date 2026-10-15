@@ -261,6 +261,9 @@ resolution live.
   folder renames/moves by moving the note's file rather than the
   directory, and `push` picks up local moves between folders (a rename or
   `mv` of a tracked file) and sends the matching folder change upstream.
+  A note you've moved but not pushed yet can still change on another
+  device: `pull` finds it at its new path by its `apple-note-id` and
+  merges the change in there, so the move still goes up on the next `push`.
   A directory the account doesn't have yet becomes a real Notes folder,
   nesting included — `mkdir Recipes/Desserts`, drop a note in, and `push`
   creates both folders ahead of the note.

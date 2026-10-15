@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import { planFolderCreates } from "../notes/folderCreate.js";
@@ -24,6 +24,7 @@ import { pendingRenameTarget, settlePendingRenames } from "../notes/pendingRenam
 import { NOTE_ID_KEY, NOTE_TITLE_KEY, readNoteId, readNoteTitle, setNoteId } from "../notes/noteIdFrontmatter.js";
 import { carriedTitleSpelling, representabilityProblem, titleIsRepresentable } from "../notes/titleFilename.js";
 import { resolveNoteIds } from "../notes/noteIdPairing.js";
+import { listUntrackedMarkdownFiles } from "../notes/untrackedFiles.js";
 import { classifyNoteRecord, type NoteDecodeResult } from "../notes/decodeNoteRecord.js";
 import { CorruptStateFileError, NotClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import { buildNoteCreateFields, buildNoteMoveFields, buildNoteTrashFields, buildNoteUpdateFields } from "../notes/encodeNoteRecord.js";
@@ -271,7 +272,7 @@ export async function buildPushPlan(
      * can't hold - where it outranks the name as the note's real title. */
     noteTitle?: string | undefined;
   }[] = [];
-  for (const file of await listUntrackedMarkdownFiles(targetDir, state)) {
+  for (const file of await listUntrackedMarkdownFiles(targetDir, state.notes)) {
     // Body only for the note itself: an untracked file's local-only
     // frontmatter never reaches parse/create or move-matching (which
     // compares against body-only base copies). The envelope is still read
@@ -1419,44 +1420,6 @@ export async function runPush(targetDir: string, options: PushOptions = {}): Pro
   await writeCloneState(targetDir, state);
 
   return { dryRun, pushed, entries: results, unchanged, notices };
-}
-
-/** Untracked `.md` files anywhere in the vault, as vault-root-relative
- * POSIX paths - the raw material for the create half, the local-move
- * pairing, and the loose-file/unknown-folder refusals. Skips
- * dot-directories (the state dir, .git) and the reserved per-folder
- * `attachments/` directories. */
-async function listUntrackedMarkdownFiles(targetDir: string, state: CloneState): Promise<string[]> {
-  const tracked = new Set(Object.values(state.notes).map((entry) => entry.file));
-  const found: string[] = [];
-
-  const walk = async (dir: string): Promise<void> => {
-    let dirents;
-    try {
-      dirents = await readdir(path.join(targetDir, dir), { withFileTypes: true });
-    } catch (cause) {
-      if (isEnoent(cause)) {
-        return;
-      }
-      throw cause;
-    }
-    for (const dirent of dirents) {
-      if (dirent.name.startsWith(".")) {
-        continue;
-      }
-      const relative = dir === "" ? dirent.name : `${dir}/${dirent.name}`;
-      if (dirent.isDirectory()) {
-        if (dirent.name.toLowerCase() !== "attachments") {
-          await walk(relative);
-        }
-      } else if (dirent.isFile() && dirent.name.endsWith(".md") && !tracked.has(relative)) {
-        found.push(relative);
-      }
-    }
-  };
-
-  await walk("");
-  return found.sort();
 }
 
 /**
