@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { bindKnownAccount, bindNewFolderAccount } from "../auth/folderAuth.js";
-import { fetchAllNoteRecords, fetchSharedNoteRecords } from "../cloudkit/databaseClient.js";
+import { describeMissingNotes, fetchAllNoteRecords, fetchSharedNoteRecords } from "../cloudkit/databaseClient.js";
 import type { CloudKitRecord } from "../cloudkit/databaseClient.js";
 import { resolveNoteAttachments, type AttachmentAuth } from "../notes/attachmentSync.js";
 import { classifyNoteRecord } from "../notes/decodeNoteRecord.js";
@@ -120,7 +120,7 @@ export async function runClone(
           ? `Skipped a shared zone the server no longer has (owner ${skipped.zoneID.ownerRecordName ?? "unknown"}, ` +
             `${skipped.serverErrorCode}) - its share was likely revoked or deleted; no notes from it were cloned`
           : `Skipped the shared zone owned by ${skipped.zoneID.ownerRecordName ?? "unknown"}: ` +
-            `${skipped.missingRecordNames.length} note(s) came through without their text and looking them up didn't ` +
+            `${describeMissingNotes(skipped.missingRecordNames)} came through without their text and looking them up didn't ` +
             "fill it in - no notes from it were cloned; the first pull will retry it",
     });
   }

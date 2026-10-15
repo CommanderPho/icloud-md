@@ -108,7 +108,7 @@ export function classifyNoteRecord(record: CloudKitRecord, options: ClassifyNote
 }
 
 function classifyNoteBody(record: CloudKitRecord, options: ClassifyNoteOptions): NoteDecodeResult {
-  if (isDeleted(record)) {
+  if (isDeletedNote(record)) {
     return { status: "deleted" };
   }
 
@@ -214,7 +214,9 @@ function classifyNoteBody(record: CloudKitRecord, options: ClassifyNoteOptions):
   return { ...base, markdownText: rendered, format: format.paragraphs, titleStripped: stripTitle, publishable: true };
 }
 
-function isDeleted(record: CloudKitRecord): boolean {
+/** Whether a note record is gone for sync purposes: a tombstone, marked
+ * `Deleted`, or sitting in Recently Deleted. */
+export function isDeletedNote(record: CloudKitRecord): boolean {
   if (record.deleted === true) {
     return true;
   }

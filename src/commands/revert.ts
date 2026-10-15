@@ -356,7 +356,12 @@ async function runEpochRevert(
       continue;
     }
     // Refuses the whole epoch, not just this record: reverting the tables
-    // alone would leave the note half at the epoch.
+    // alone would leave the note half at the epoch. An epoch with no
+    // snapshot of the note's own text never reaches this, and reverts its
+    // tables as any such epoch does (with the "skipped" notice above) -
+    // tables are records of their own, so that writes nothing to the asset.
+    // Like every remote check here, it runs only once confirmed: the dry
+    // run never touches the network.
     verifyRecordRevertible(record, fileArg);
     updates.push({
       recordName: record.recordName,

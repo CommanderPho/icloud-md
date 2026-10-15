@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promis
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import {
+  describeMissingNotes,
   fetchAllNoteRecords,
   fetchSharedNoteRecords,
   lookupRecords,
@@ -225,8 +226,9 @@ export async function runPull(
         skipped.reason === "zone-not-found"
           ? `Skipped a shared zone the server no longer has (owner ${owner ?? "unknown"}, ${skipped.serverErrorCode}) - ` +
             "its share was likely revoked or deleted; its local notes were left in place and stay tracked for now"
-          : `Skipped the shared zone owned by ${owner ?? "unknown"} this run: ${skipped.missingRecordNames.length} ` +
-            "note(s) came through without their text and looking them up didn't fill it in - nothing from that zone " +
+          : `Skipped the shared zone owned by ${owner ?? "unknown"} this run: ` +
+            `${describeMissingNotes(skipped.missingRecordNames)} came through without their text and looking them up ` +
+            "didn't fill it in - nothing from that zone " +
             "was touched, and the next pull will retry it",
     });
   }

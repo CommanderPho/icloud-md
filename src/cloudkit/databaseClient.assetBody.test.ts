@@ -12,7 +12,7 @@ const scratchHome = await mkdtemp(path.join(tmpdir(), "icloud-md-test-home-"));
 process.env.HOME = scratchHome;
 process.env.USERPROFILE = scratchHome;
 
-const { fetchAllNoteRecords, fetchSharedNoteRecords } = await import("./databaseClient.js");
+const { describeMissingNotes, fetchAllNoteRecords, fetchSharedNoteRecords } = await import("./databaseClient.js");
 const { classifyNoteRecord } = await import("../notes/decodeNoteRecord.js");
 const { compressNoteDocument } = await import("../notes/noteText.js");
 const { StringSchema } = await import("../notes/gen/topotext_pb.js");
@@ -201,6 +201,109 @@ test("fetchAllNoteRecords treats a TextDataAsset with no download URL as a faile
   }
 });
 
+test("fetchAllNoteRecords doesn't download the text of a large note in Recently Deleted", async () => {
+  // It's classified "deleted" whatever its body - and if Apple has already
+  // collected the asset, a failing download would abort the whole clone.
+  const listed = assetBodyRecord();
+  const trashed = {
+    ...listed,
+    fields: {
+      ...(listed.fields as Record<string, unknown>),
+      Folder: { value: { recordName: "TrashFolder-CloudKit", action: "VALIDATE" }, type: "REFERENCE" },
+    },
+  };
+  const mock = installFetchMock({
+    database: "private",
+    listed: trashed,
+    assetResponse: () => new Response("Gone", { status: 410 }),
+  });
+  try {
+    const { records } = await fetchAllNoteRecords(session, HOST, "12345");
+
+    assert.deepEqual(mock.assetDownloads, []);
+    assert.equal(mock.lookups, 0);
+    const [record] = records;
+    assert.ok(record);
+    assert.deepEqual(classifyNoteRecord(record), { status: "deleted" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("fetchAllNoteRecords leaves a large note deleted since its listing body-less instead of failing", async () => {
+  const mock = installFetchMock({
+    database: "private",
+    listed: assetBodyRecord(),
+    lookedUp: { recordName: "big-note", serverErrorCode: "NOT_FOUND", reason: "record not found" },
+    assetResponse: () => new Response("Gone", { status: 410 }),
+  });
+  try {
+    const { records, syncToken } = await fetchAllNoteRecords(session, HOST, "12345");
+
+    assert.equal(syncToken, "token-new");
+    assert.equal(mock.lookups, 1);
+    assert.deepEqual(mock.assetDownloads, [ASSET_URL]);
+    const [record] = records;
+    assert.ok(record);
+    // missing-body never untracks a note; the next pull lists the deletion.
+    assert.deepEqual(classifyNoteRecord(record), { status: "unsyncable", reason: "missing-body" });
+  } finally {
+    mock.restore();
+  }
+});
+
+test("fetchAllNoteRecords still fails when the retry lookup comes back empty for any other reason", async () => {
+  const mock = installFetchMock({
+    database: "private",
+    listed: assetBodyRecord(),
+    lookedUp: { recordName: "big-note", serverErrorCode: "THROTTLED", reason: "try later" },
+    assetResponse: () => new Response("Gone", { status: 410 }),
+  });
+  try {
+    await assert.rejects(fetchAllNoteRecords(session, HOST, "12345"), /HTTP 410/);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("fetchAllNoteRecords takes a large note's fresh record as is once it's been edited back under the limit", async () => {
+  const bytes = noteDocumentBytes("Today\n~~~\n\nshorter now");
+  const listed = assetBodyRecord();
+  const mock = installFetchMock({
+    database: "private",
+    listed,
+    lookedUp: {
+      recordName: "big-note",
+      recordType: "Note",
+      recordChangeTag: "tag-small",
+      fields: {
+        TitleEncrypted: (listed.fields as Record<string, unknown>).TitleEncrypted,
+        TextDataEncrypted: { value: bytes.toString("base64"), type: "ENCRYPTED_BYTES" },
+      },
+    },
+    assetResponse: () => new Response("Gone", { status: 410 }),
+  });
+  try {
+    const { records } = await fetchAllNoteRecords(session, HOST, "12345");
+
+    assert.deepEqual(mock.assetDownloads, [ASSET_URL]);
+    const [record] = records;
+    assert.ok(record);
+    assert.equal(record.recordChangeTag, "tag-small");
+    assert.equal(record.fields.TextDataEncrypted?.value, bytes.toString("base64"));
+    const decoded = classifyNoteRecord(record);
+    // Back inline, so nothing marks it read-only any more.
+    assert.equal(decoded.status === "ok" ? decoded.publishable : undefined, true);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("describeMissingNotes names the notes holding a zone back, up to five", () => {
+  assert.equal(describeMissingNotes(["big-note"]), "1 note(s) (big-note)");
+  assert.equal(describeMissingNotes(["a", "b", "c", "d", "e", "f", "g"]), "7 note(s) (a, b, c, d, e, and 2 more)");
+});
+
 /** A shared `changes/zone` listing record: like every shared note, it comes
  * back without its text, so `fetchSharedNoteRecords` looks it up. */
 function bodylessSharedRecord(): Record<string, unknown> {
@@ -228,6 +331,32 @@ test("fetchSharedNoteRecords inlines the asset text of a large note the body loo
     assert.equal(zones[0]?.syncToken, "token-new");
     assert.equal(zones[0]?.records[0]?.fields.TextDataEncrypted?.value, bytes.toString("base64"));
     assert.deepEqual(mock.assetDownloads, [ASSET_URL]);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("fetchSharedNoteRecords doesn't hold a zone back over a body-less note in Recently Deleted", async () => {
+  const listed = bodylessSharedRecord();
+  const mock = installFetchMock({
+    database: "shared",
+    listed: {
+      ...listed,
+      fields: {
+        ...(listed.fields as Record<string, unknown>),
+        Folder: { value: { recordName: "TrashFolder-CloudKit", action: "VALIDATE" }, type: "REFERENCE" },
+      },
+    },
+    lookedUp: assetBodyRecord(),
+    assetResponse: () => new Response("Gone", { status: 410 }),
+  });
+  try {
+    const { zones, skippedZones } = await fetchSharedNoteRecords(session, HOST, "12345");
+
+    assert.deepEqual(skippedZones, []);
+    assert.equal(zones.length, 1);
+    assert.equal(mock.lookups, 0);
+    assert.deepEqual(mock.assetDownloads, []);
   } finally {
     mock.restore();
   }
