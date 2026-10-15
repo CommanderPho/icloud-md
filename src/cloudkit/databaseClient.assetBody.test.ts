@@ -77,7 +77,8 @@ interface FetchMock {
 
 /**
  * Serves one zone's `changes/zone` listing (`listed`), a `records/lookup`
- * answering with `lookedUp` (or nothing), and asset downloads through
+ * answering with `lookedUp` (or nothing) - or with `retryLookedUp` from the
+ * second lookup on, when given - and asset downloads through
  * `assetResponse`. `database` picks the private zone, or a single shared
  * zone owned by `_owner1`.
  */
@@ -85,6 +86,7 @@ function installFetchMock(options: {
   database: "private" | "shared";
   listed: Record<string, unknown>;
   lookedUp?: Record<string, unknown> | undefined;
+  retryLookedUp?: Record<string, unknown> | undefined;
   assetResponse: (url: string) => Response;
 }): FetchMock {
   const realFetch = globalThis.fetch;
@@ -103,7 +105,8 @@ function installFetchMock(options: {
     }
     if (href.includes(`/${options.database}/records/lookup`)) {
       state.lookups += 1;
-      return jsonResponse({ records: options.lookedUp ? [options.lookedUp] : [] });
+      const answer = state.lookups > 1 && options.retryLookedUp ? options.retryLookedUp : options.lookedUp;
+      return jsonResponse({ records: answer ? [answer] : [] });
     }
     if (href.startsWith("https://cvws.icloud-content.example/")) {
       state.assetDownloads.push(href);
@@ -384,6 +387,34 @@ test("fetchSharedNoteRecords holds back only the zone whose large-note download 
     // The body lookup, then one fresh lookup before giving up.
     assert.equal(mock.lookups, 2);
     assert.equal(mock.assetDownloads.length, 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("fetchSharedNoteRecords holds a zone back, without failing, over a large note deleted between its body lookup and the asset retry", async () => {
+  const mock = installFetchMock({
+    database: "shared",
+    listed: bodylessSharedRecord(),
+    lookedUp: assetBodyRecord(),
+    retryLookedUp: { recordName: "big-note", serverErrorCode: "NOT_FOUND", reason: "record not found" },
+    assetResponse: () => new Response("Gone", { status: 410 }),
+  });
+  try {
+    const { zones, skippedZones } = await fetchSharedNoteRecords(session, HOST, "12345");
+
+    // Held back one pull, like any body lookup that misses; the next pull
+    // lists the deletion.
+    assert.deepEqual(zones, []);
+    assert.deepEqual(skippedZones, [
+      {
+        zoneID: { zoneName: "Notes", ownerRecordName: "_owner1" },
+        reason: "missing-note-bodies",
+        missingRecordNames: ["big-note"],
+      },
+    ]);
+    assert.equal(mock.lookups, 2);
+    assert.deepEqual(mock.assetDownloads, [ASSET_URL]);
   } finally {
     mock.restore();
   }

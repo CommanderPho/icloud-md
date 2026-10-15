@@ -627,7 +627,7 @@ interface ZoneSource {
  * write and still refuses a note stored as an asset.
  *
  * A download that fails even after a fresh `lookup` (see
- * `downloadTextAsset`) must not read as a clean sync while the syncToken
+ * `resolveTextAsset`) must not read as a clean sync while the syncToken
  * moves past the note. In the private zone it throws: there's only the one
  * zone, so holding it back and failing are the same thing. In a shared zone
  * the body is left missing, and `fetchSharedNoteRecords`' existing
