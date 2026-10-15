@@ -349,6 +349,25 @@ export class CloudKitZoneFetchFailedError extends CloudKitRequestFailedError {
   }
 }
 
+/**
+ * A paged listing (`changes/zone` or `changes/database`) said `moreComing`
+ * but handed back no new syncToken, so the next request would be the one just
+ * made. The generic "wait and retry" hint is wrong here: nothing about the
+ * stored token changes when this throws, so every retry fails identically.
+ * Never observed on a real account - the guard exists so a server in that
+ * state can't spin a pull forever.
+ */
+export class CloudKitSyncTokenStalledError extends CloudKitRequestFailedError {
+  constructor(label: string) {
+    super(`${label} reported moreComing without a new syncToken; refusing to re-request the same page`, {
+      hint:
+        "iCloud keeps handing back the same page of changes, so retrying sends the same request and fails the " +
+        "same way. Please open a GitHub issue including this message. If it's a pull that keeps failing, cloning " +
+        "into a new folder starts over without the stored sync token, which may get past it.",
+    });
+  }
+}
+
 /** A `history`/`diff`/`revert` snapshot id that doesn't match any recorded
  * version for the given file - either mistyped, or from a different file's
  * history. */

@@ -14,7 +14,7 @@ process.env.HOME = scratchHome;
 process.env.USERPROFILE = scratchHome;
 
 const { fetchAllNoteRecords, fetchAllZoneRecords, fetchSharedNoteRecords } = await import("./databaseClient.js");
-const { CloudKitRequestFailedError } = await import("../errors.js");
+const { CloudKitRequestFailedError, CloudKitSyncTokenStalledError } = await import("../errors.js");
 
 const session = {
   cookie: "cookie",
@@ -52,9 +52,13 @@ function zonePage(moreComing: boolean, syncToken: string | undefined, recordName
 /**
  * Serves scripted `changes/zone` responses in order and fails the test on
  * any request past the script - which is what the unguarded loop would make,
- * forever. `changes/database` (the shared zone listing) gets one owner.
+ * forever. `changes/database` (the shared zone listing) lists `owners`, in
+ * order - one owner unless told otherwise.
  */
-function installFetchMock(responses: unknown[]): { restore: () => void; zoneRequests: Record<string, unknown>[] } {
+function installFetchMock(
+  responses: unknown[],
+  owners: string[] = ["_ownerA"],
+): { restore: () => void; zoneRequests: Record<string, unknown>[] } {
   const zoneRequests: Record<string, unknown>[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -62,7 +66,9 @@ function installFetchMock(responses: unknown[]): { restore: () => void; zoneRequ
     if (href.includes("/shared/changes/database")) {
       return jsonResponse({
         moreComing: false,
-        zones: [{ zoneID: { zoneName: "Notes", ownerRecordName: "_ownerA", zoneType: "REGULAR_CUSTOM_ZONE" } }],
+        zones: owners.map((ownerRecordName) => ({
+          zoneID: { zoneName: "Notes", ownerRecordName, zoneType: "REGULAR_CUSTOM_ZONE" },
+        })),
       });
     }
     if (!href.includes("/changes/zone")) {
@@ -85,8 +91,15 @@ function installFetchMock(responses: unknown[]): { restore: () => void; zoneRequ
 }
 
 function isStalledPageError(error: unknown): boolean {
-  return error instanceof CloudKitRequestFailedError && /moreComing without a new syncToken/.test(error.message);
+  return error instanceof CloudKitSyncTokenStalledError && /moreComing without a new syncToken/.test(error.message);
 }
+
+test("the stalled-page error says retrying won't help, not the generic wait-and-retry hint", () => {
+  const error = new CloudKitSyncTokenStalledError("private changes/zone");
+  assert.ok(error instanceof CloudKitRequestFailedError);
+  assert.match(error.hint ?? "", /retrying sends the same request/);
+  assert.doesNotMatch(error.hint ?? "", /wait a moment/);
+});
 
 test("an incremental walk fails loudly when a moreComing page hands back the token it was sent", async () => {
   const { restore, zoneRequests } = installFetchMock([zonePage(true, "stored", "note-1")]);
@@ -174,11 +187,35 @@ test("the last page may repeat or omit the token - moreComing false ends the wal
   }
 });
 
-test("a stalled shared zone is fatal, not skipped - a partial listing must not look like a clean sync", async () => {
-  const { restore, zoneRequests } = installFetchMock([zonePage(true, "stored-a", "note-a", "_ownerA")]);
+test("an empty-string token on a moreComing page counts as no token - it must not restart the walk from scratch", async () => {
+  const { restore, zoneRequests } = installFetchMock([zonePage(true, "", "note-1")]);
   try {
-    await assert.rejects(fetchSharedNoteRecords(session, host, "12345", { _ownerA: "stored-a" }), isStalledPageError);
+    await assert.rejects(fetchAllNoteRecords(session, host, "12345", "stored"), isStalledPageError);
     assert.equal(zoneRequests.length, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("a stalled shared zone is skipped with its own reason, and the other shared zones still come through", async () => {
+  const { restore, zoneRequests } = installFetchMock(
+    [zonePage(true, "stored-a", "note-a", "_ownerA"), zonePage(false, "fresh-b", "note-b", "_ownerB")],
+    ["_ownerA", "_ownerB"],
+  );
+  try {
+    const result = await fetchSharedNoteRecords(session, host, "12345", { _ownerA: "stored-a", _ownerB: "stored-b" });
+    assert.deepEqual(result.skippedZones, [
+      { zoneID: { zoneName: "Notes", ownerRecordName: "_ownerA" }, reason: "stalled-sync-token" },
+    ]);
+    assert.equal(result.zones.length, 1);
+    assert.equal(result.zones[0]?.zoneID.ownerRecordName, "_ownerB");
+    assert.equal(result.zones[0]?.syncToken, "fresh-b");
+    assert.deepEqual(
+      result.zones[0]?.records.map((record) => record.recordName),
+      ["note-b"],
+    );
+    // One request per zone - the stalled one is never asked again.
+    assert.equal(zoneRequests.length, 2);
   } finally {
     restore();
   }
