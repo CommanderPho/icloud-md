@@ -257,7 +257,7 @@ export async function fetchZoneNoteRecords(
       onPage?.(pageRecords.length);
     }
 
-    return { records, syncToken };
+    return { records: dedupeZoneRecords(records), syncToken };
   };
 
   if (sinceSyncToken === undefined) {
@@ -318,7 +318,52 @@ export async function fetchAllZoneRecords(
     onPage?.((zone.records ?? []).length);
   }
 
-  return records;
+  return dedupeZoneRecords(records);
+}
+
+/**
+ * Collapses repeated occurrences of a record in one zone's `changes/zone`
+ * walk. CloudKit occasionally lists the same record on two pages of a single
+ * walk (issue #32: about 1 clone in 9 on a 118-note account). Kept as-is,
+ * clone writes that note twice - the second copy under a uniquified name and
+ * untracked - and the next push creates it in iCloud as a brand-new note.
+ *
+ * Callers pass one zone's records, so `recordName` is the key: the same name
+ * in another zone is a different record and is never collapsed here. The
+ * occurrence with the greater `modified.timestamp` wins when both carry one
+ * and they differ; otherwise the later one does, since a later page is a
+ * later read of the server. That covers a tombstone (no `modified`) listed
+ * after a live copy. Change tags are opaque rather than ordered, so they are
+ * never compared. The winner takes the first occurrence's position, keeping
+ * file naming in listing order of first appearance.
+ *
+ * Ported from ferdousbhai/icloud-for-omarchy@fc242a5.
+ */
+export function dedupeZoneRecords(records: CloudKitRecord[]): CloudKitRecord[] {
+  const indexByName = new Map<string, number>();
+  const deduped: CloudKitRecord[] = [];
+  for (const record of records) {
+    const at = indexByName.get(record.recordName);
+    if (at === undefined) {
+      indexByName.set(record.recordName, deduped.length);
+      deduped.push(record);
+      continue;
+    }
+    const kept = deduped[at];
+    if (kept === undefined || supersedes(record, kept)) {
+      deduped[at] = record;
+    }
+  }
+  return deduped;
+}
+
+/** Whether `later`, listed after `kept` in the same walk, replaces it; see
+ * `dedupeZoneRecords`. */
+function supersedes(later: CloudKitRecord, kept: CloudKitRecord): boolean {
+  if (later.modified !== undefined && kept.modified !== undefined && later.modified.timestamp !== kept.modified.timestamp) {
+    return later.modified.timestamp > kept.modified.timestamp;
+  }
+  return true;
 }
 
 /** Fetches records in the account's own (private-database) Notes zone. */
@@ -380,7 +425,17 @@ export async function fetchSharedZoneIds(
     moreComing = page.moreComing;
   }
 
-  return zoneIds;
+  // A zone listed on two pages would otherwise be fetched - and its notes
+  // cloned - twice; see `dedupeZoneRecords` for the record-level version.
+  const seen = new Set<string>();
+  return zoneIds.filter((zoneID) => {
+    const key = JSON.stringify([zoneID.zoneName, zoneID.ownerRecordName ?? null]);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 /** One page of a shared `changes/database` listing; `moreComing`/`syncToken`
