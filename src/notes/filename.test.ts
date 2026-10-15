@@ -82,6 +82,20 @@ test("claimFreeFileName lets a candidate that is the file being moved through, a
   }
 });
 
+test("claimFreeFileName treats a hard link under a different name as taken", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "filename-test-"));
+  try {
+    // Same inode, but not a case-only alias: rename() between two links of
+    // one file is a no-op, so moving onto it would leave the old name behind.
+    await writeFile(path.join(dir, "Tart.md"), "moving", "utf-8");
+    await link(path.join(dir, "Tart.md"), path.join(dir, "Pie.md"));
+
+    assert.equal(await claimFreeFileName(dir, "Pie.md", new Set(), path.join(dir, "Tart.md")), "Pie 2.md");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fileNameCarriesTitle accepts the name a title derives", () => {
   assert.equal(fileNameCarriesTitle("Groceries.md", "Groceries"), true);
   assert.equal(fileNameCarriesTitle("Pat⁄Alex.md", "Pat/Alex"), true);
