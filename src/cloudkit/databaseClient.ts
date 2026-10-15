@@ -208,6 +208,10 @@ async function postDatabase(
  * something else in the request, the token-free retry hits it identically
  * and that error propagates - the fallback only "sticks" when dropping the
  * token was the fix.
+ *
+ * A page that says `moreComing` without advancing the syncToken is fatal (see
+ * `assertZonePageAdvances`) and doesn't trigger that fallback: the server
+ * accepted the token, so dropping it isn't the fix.
  */
 export async function fetchZoneNoteRecords(
   session: IcloudSession,
@@ -252,6 +256,7 @@ export async function fetchZoneNoteRecords(
       const pageRecords = zone.records ?? [];
 
       records.push(...pageRecords);
+      assertZonePageAdvances(`${database} changes/zone`, zone, syncToken);
       syncToken = zone.syncToken ?? syncToken;
       moreComing = zone.moreComing === true;
       onPage?.(pageRecords.length);
@@ -313,6 +318,7 @@ export async function fetchAllZoneRecords(
     );
     const zone = firstZone(body);
     records.push(...(zone.records ?? []));
+    assertZonePageAdvances("private changes/zone", zone, syncToken);
     syncToken = zone.syncToken ?? syncToken;
     moreComing = zone.moreComing === true;
     onPage?.((zone.records ?? []).length);
@@ -940,6 +946,21 @@ export function firstZone(body: unknown): ParsedZone {
     syncToken: typeof zone.syncToken === "string" ? zone.syncToken : undefined,
     records,
   };
+}
+
+/**
+ * The `changes/zone` counterpart of `fetchSharedZoneIds`'s guard: a page that
+ * says `moreComing` but hands back no syncToken, or the one the request
+ * carried, would have the paging loop request that same page forever.
+ * Throws rather than looping; nothing gathered so far is returned, so the
+ * caller keeps its old token and a partial listing is never acted on.
+ */
+function assertZonePageAdvances(label: string, zone: ParsedZone, requestToken: string | undefined): void {
+  if (zone.moreComing === true && (zone.syncToken === undefined || zone.syncToken === requestToken)) {
+    throw new CloudKitRequestFailedError(
+      `${label} reported moreComing without a new syncToken; refusing to re-request the same page`,
+    );
+  }
 }
 
 /**
