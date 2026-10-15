@@ -365,9 +365,10 @@ A few consequences worth knowing before you pick:
   title turns out to be one a name can carry after all. Deleting the key
   asks for the other title: the one the file name spells, so an
   `Untitled.md` whose key you remove becomes a note titled "Untitled".
-  (Not from a name ending in a number like `Untitled 2.md`, which `pull`
-  may have added: `push` refuses that one and asks you to rename the file
-  to the title you want.)
+  (Not when `pull` numbered the name, like an `Untitled 2.md` sitting next
+  to an `Untitled.md`: there `push` keeps the old title, still syncs the
+  rest of the note, and warns until you rename the file to the title you
+  want or put the key back. `restore` puts the key back too.)
 - **A note retitled on your phone gets its file renamed on the next
   `pull`**, since there is nowhere else for the new title to go. A retitle
   you asked for locally takes the same road, which is why renaming is always

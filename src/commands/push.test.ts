@@ -7,7 +7,7 @@ import { readBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
 import { writeCloneState, type CloneState } from "../notes/cloneState.js";
 import { localFileState } from "../notes/localFileState.js";
 import { NotClonedDirectoryError, UnboundAccountError } from "../errors.js";
-import { buildPushPlan, planRemoteChangedMerge, runPush, titleKeyIntent } from "./push.js";
+import { buildPushPlan, moveTitleIntent, planRemoteChangedMerge, runPush, titleKeyIntent } from "./push.js";
 
 async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
   const dir = await mkdtemp(path.join(tmpdir(), "push-test-"));
@@ -301,7 +301,7 @@ test("buildPushPlan defers a shared note's removed apple-note-title to the live 
     // refusal waits for the live comparison - which needs the network.
     const shared = { ...emptyState(), titleMode: "filename" as const };
     shared.notes = {
-      LOOSE1: {
+      [NOTE_ID]: {
         file: "Pat/Untitled.md",
         recordChangeTag: "1a",
         modificationDate: 100,
@@ -310,8 +310,8 @@ test("buildPushPlan defers a shared note's removed apple-note-title to the live 
       },
     };
     await writeCloneState(dir, shared);
-    await writeBaseCopy(dir, "LOOSE1", "Hello");
-    await writeVaultFile(dir, "Pat/Untitled.md", "---\napple-note-id: LOOSE1\n---\n\nHello");
+    await writeBaseCopy(dir, NOTE_ID, "Hello");
+    await writeVaultFile(dir, "Pat/Untitled.md", `---\napple-note-id: ${NOTE_ID}\n---\n\nHello`);
 
     await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
   }));
@@ -341,95 +341,172 @@ test("buildPushPlan doesn't read an apple-note-title it can't parse as a removal
     }
   }));
 
-test("buildPushPlan refuses a removed apple-note-title when the file name may carry pull's collision number", () =>
+/** A filename-as-title vault tracking one own note that recorded a key, plus
+ * (optionally) the unnumbered sibling that made pull number it. */
+async function writeKeyedNote(dir: string, file: string, options: { body?: string; sibling?: string } = {}): Promise<void> {
+  const own = { ...emptyState(), titleMode: "filename" as const };
+  own.notes = {
+    [NOTE_ID]: {
+      file,
+      recordChangeTag: "1a",
+      modificationDate: 100,
+      folderRecordName: "DefaultFolder-CloudKit",
+      frontmatterTitle: "Restaurants ",
+    },
+  };
+  if (options.sibling !== undefined) {
+    own.notes.SIBLING = { file: options.sibling, recordChangeTag: "1a", modificationDate: 100, folderRecordName: "DefaultFolder-CloudKit" };
+    await writeBaseCopy(dir, "SIBLING", "Sibling");
+    await writeVaultFile(dir, options.sibling, "Sibling");
+  }
+  await writeCloneState(dir, own);
+  await writeBaseCopy(dir, NOTE_ID, "Hello");
+  // The key removed, the id left: what deleting the one line leaves behind.
+  await writeVaultFile(dir, file, `---\napple-note-id: ${NOTE_ID}\n---\n\n${options.body ?? "Hello"}`);
+}
+
+test("buildPushPlan warns, and keeps the title, when a removed apple-note-title would leave pull's collision number as the title", () =>
   withTempDir(async (dir) => {
-    // "Untitled 2.md" is the second note pull couldn't name; removing its key
-    // must not title the note "Untitled 2".
-    const own = { ...emptyState(), titleMode: "filename" as const };
-    own.notes = {
-      REC1: {
-        file: "Notes/Untitled 2.md",
-        recordChangeTag: "1a",
-        modificationDate: 100,
-        folderRecordName: "DefaultFolder-CloudKit",
-        frontmatterTitle: "Restaurants ",
-      },
-    };
-    await writeCloneState(dir, own);
-    await writeBaseCopy(dir, "REC1", "Hello");
-    await writeVaultFile(dir, "Notes/Untitled 2.md", "Hello");
+    // "Untitled 2.md" is the second note pull couldn't name (there's an
+    // "Untitled.md" beside it); removing its key must not title the note
+    // "Untitled 2". The question stays open, so it's asked on every plan.
+    await writeKeyedNote(dir, "Notes/Untitled 2.md", { sibling: "Notes/Untitled.md" });
 
-    const { entries } = await buildPushPlan(dir);
+    const { entries, notices } = await buildPushPlan(dir);
 
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0]?.resolution, "refused");
-    assert.match(entries[0]?.reason ?? "", /"Untitled 2" may carry a number pull added/);
+    assert.deepEqual(entries, []);
+    assert.equal(notices.length, 1);
+    assert.equal(notices[0]?.level, "warn");
+    assert.match(notices[0]?.message ?? "", /^Notes\/Untitled 2\.md: .*"Untitled 2" may carry a number pull added/);
   }));
 
-test("buildPushPlan refuses a moved note whose removed apple-note-title would leave a numbered name as its title", () =>
+test("buildPushPlan still pushes the body of a note whose removed apple-note-title it won't honor", () =>
   withTempDir(async (dir) => {
-    const id = "5B1A2C3D-4E5F-4A6B-8C7D-9E0F1A2B3C4D";
-    const own = { ...emptyState(), titleMode: "filename" as const };
-    own.notes = {
-      [id]: {
-        file: "Notes/Untitled 2.md",
-        recordChangeTag: "1a",
-        modificationDate: 100,
-        folderRecordName: "DefaultFolder-CloudKit",
-        frontmatterTitle: "Restaurants ",
-      },
-    };
-    await writeCloneState(dir, own);
-    await writeBaseCopy(dir, id, "Hello");
-    await writeVaultFile(dir, "Recipes/Untitled 2.md", `---\napple-note-id: ${id}\n---\n\nHello`);
+    // Only the title is held back: an edit made alongside the removal goes
+    // to the network like any other.
+    await writeKeyedNote(dir, "Notes/Untitled 2.md", { sibling: "Notes/Untitled.md", body: "Hello, edited" });
 
-    const { entries } = await buildPushPlan(dir);
+    await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
+  }));
 
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0]?.kind, "move");
-    assert.equal(entries[0]?.resolution, "refused");
-    assert.match(entries[0]?.reason ?? "", /may carry a number pull added/);
+test("buildPushPlan honors a removed apple-note-title on a name that only ends in a number", () =>
+  withTempDir(async (dir) => {
+    // "Q3-Q4 2024.md" has no "Q3-Q4.md" beside it, so pull never numbered
+    // it: the name is the user's, and removing the key asks for it.
+    await writeKeyedNote(dir, "Notes/Q3-Q4 2024.md");
+
+    await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
+  }));
+
+test("buildPushPlan doesn't read a file with no envelope as a removed apple-note-title", () =>
+  withTempDir(async (dir) => {
+    // What an older build's `restore` wrote: the body alone. State still
+    // records the key, but the file never said it was removed, so the note
+    // stays clean - it mustn't be retitled to "Untitled" after an upgrade.
+    await writeKeyedNote(dir, "Notes/Untitled.md");
+    await writeVaultFile(dir, "Notes/Untitled.md", "Hello");
+
+    const { entries, notices } = await buildPushPlan(dir);
+
+    assert.deepEqual(entries, []);
+    assert.deepEqual(notices, []);
   }));
 
 test("titleKeyIntent: what state records once a note's apple-note-title is settled", () => {
   const entry = { file: "Notes/Untitled.md", recordChangeTag: "1a", modificationDate: 100, frontmatterTitle: "Restaurants " };
+  const options = { filenameAsTitle: true, nameMayBeNumbered: () => false };
 
   // A removed key asks for the name's title, and is recorded as removed -
   // otherwise every later plan would read the removal as a request again.
-  assert.deepEqual(titleKeyIntent("---\napple-note-id: X\n---\n\n", entry, true), {
+  assert.deepEqual(titleKeyIntent({ kind: "absent" }, entry, entry.file, options), {
     requestedTitle: "Untitled",
     recordedTitle: undefined,
+    keyRemoved: true,
   });
-  assert.deepEqual(titleKeyIntent("", entry, true), { requestedTitle: "Untitled", recordedTitle: undefined });
   // A stated key is both the request and the record.
-  assert.deepEqual(titleKeyIntent('---\napple-note-title: "Other "\n---\n\n', entry, true), {
+  assert.deepEqual(titleKeyIntent({ kind: "stated", title: "Other " }, entry, entry.file, options), {
     requestedTitle: "Other ",
     recordedTitle: "Other ",
   });
-  // An unreadable key asks nothing and keeps state's record.
-  assert.deepEqual(titleKeyIntent("---\ntags: [a\n---\n\n", entry, true), { recordedTitle: "Restaurants " });
+  // An unreadable key, or a file with no id-stamped envelope, asks nothing
+  // and keeps state's record.
+  assert.deepEqual(titleKeyIntent({ kind: "unreadable" }, entry, entry.file, options), { recordedTitle: "Restaurants " });
+  assert.deepEqual(titleKeyIntent({ kind: "unmarked" }, entry, entry.file, options), { recordedTitle: "Restaurants " });
+  // A removal from a name pull may have numbered keeps the record too, so
+  // the warning stands until the user settles it.
+  const numbered = titleKeyIntent({ kind: "absent" }, entry, entry.file, { ...options, nameMayBeNumbered: () => true });
+  assert.equal(numbered.requestedTitle, undefined);
+  assert.equal(numbered.recordedTitle, "Restaurants ");
+  assert.match(numbered.notice ?? "", /may carry a number pull added/);
   // A note that never had a key has nothing to remove.
-  assert.deepEqual(titleKeyIntent("", { ...entry, frontmatterTitle: undefined }, true), { recordedTitle: undefined });
+  assert.deepEqual(titleKeyIntent({ kind: "absent" }, { ...entry, frontmatterTitle: undefined }, entry.file, options), {
+    recordedTitle: undefined,
+  });
   // An in-body vault never reads the key.
-  assert.deepEqual(titleKeyIntent("", entry, false), { recordedTitle: "Restaurants " });
+  assert.deepEqual(titleKeyIntent({ kind: "absent" }, entry, entry.file, { ...options, filenameAsTitle: false }), {
+    recordedTitle: "Restaurants ",
+  });
+});
+
+test("moveTitleIntent: a moved note's title, and the key state records for it", () => {
+  const entry = { file: "Notes/Untitled.md", recordChangeTag: "1a", modificationDate: 100, frontmatterTitle: "a/b" };
+  const options = { filenameAsTitle: true, nameMayBeNumbered: () => false };
+  const pair = { recordName: NOTE_ID, entry, toFile: "Recipes/Untitled.md" };
+  const noTitles = new Map<string, string>();
+
+  // A kept key keeps proposing its own title (`prepareRetitle` finds the
+  // note already has it and sends nothing), and stays recorded.
+  assert.deepEqual(moveTitleIntent(pair, { titleKey: { kind: "stated", title: "a/b" }, noteId: NOTE_ID }, new Map([[pair.toFile, "a/b"]]), options), {
+    newTitle: "a/b",
+    keyRemoved: false,
+    recordedTitle: "a/b",
+    notice: undefined,
+  });
+  // Matched by id with the key gone: the removal asks for the name's title.
+  assert.deepEqual(moveTitleIntent(pair, { titleKey: { kind: "absent" }, noteId: NOTE_ID }, noTitles, options), {
+    newTitle: "Untitled",
+    keyRemoved: true,
+    recordedTitle: undefined,
+    notice: undefined,
+  });
+  // Paired by content or name, with no id: the file never recorded a title,
+  // so this stays a plain relocation.
+  assert.deepEqual(moveTitleIntent(pair, { titleKey: { kind: "unmarked" } }, noTitles, options), {
+    newTitle: undefined,
+    keyRemoved: false,
+    recordedTitle: "a/b",
+    notice: undefined,
+  });
+  // A stale id from another note is no better than none.
+  assert.equal(moveTitleIntent(pair, { titleKey: { kind: "absent" }, noteId: "OTHER" }, noTitles, options).keyRemoved, false);
+
+  // A name pull numbered is judged where pull put it, and only when the move
+  // kept the name: the move goes ahead, the title doesn't change.
+  const numberedEntry = { ...entry, file: "Notes/Untitled 2.md" };
+  const isNumbered = (file: string): boolean => file === "Notes/Untitled 2.md";
+  const kept = moveTitleIntent(
+    { recordName: NOTE_ID, entry: numberedEntry, toFile: "Recipes/Untitled 2.md" },
+    { titleKey: { kind: "absent" }, noteId: NOTE_ID },
+    noTitles,
+    { ...options, nameMayBeNumbered: isNumbered },
+  );
+  assert.equal(kept.newTitle, undefined);
+  assert.equal(kept.recordedTitle, "a/b");
+  assert.match(kept.notice ?? "", /may carry a number pull added/);
+  // Renaming it is choosing the name.
+  const renamed = moveTitleIntent(
+    { recordName: NOTE_ID, entry: numberedEntry, toFile: "Notes/Lunch 2.md" },
+    { titleKey: { kind: "absent" }, noteId: NOTE_ID },
+    noTitles,
+    { ...options, nameMayBeNumbered: isNumbered },
+  );
+  assert.equal(renamed.newTitle, "Lunch 2");
+  assert.equal(renamed.notice, undefined);
 });
 
 test("buildPushPlan takes a removed apple-note-title on an own note to the network as a retitle", () =>
   withTempDir(async (dir) => {
-    const own = { ...emptyState(), titleMode: "filename" as const };
-    own.notes = {
-      REC1: {
-        file: "Notes/Untitled.md",
-        recordChangeTag: "1a",
-        modificationDate: 100,
-        folderRecordName: "DefaultFolder-CloudKit",
-        frontmatterTitle: "Restaurants ",
-      },
-    };
-    await writeCloneState(dir, own);
-    await writeBaseCopy(dir, "REC1", "Hello");
-    // No envelope at all: removing the last key removes the block too.
-    await writeVaultFile(dir, "Notes/Untitled.md", "Hello");
+    await writeKeyedNote(dir, "Notes/Untitled.md");
 
     await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
   }));

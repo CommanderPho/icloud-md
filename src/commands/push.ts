@@ -321,6 +321,13 @@ export async function buildPushPlan(
     });
   }
   const titleKeys = new Map(untracked.map((entry) => [entry.file, entry.noteTitleKey]));
+  const noteIds = new Map(untracked.map((entry) => [entry.file, entry.noteId]));
+  // Every name a note file holds or held, for telling a name pull numbered
+  // from one that only ends in a number - see `mayBeNumberedName`.
+  const takenFiles = new Set(
+    [...Object.values(state.notes).map((entry) => entry.file), ...markdownFiles.files].map((file) => file.toLowerCase()),
+  );
+  const nameMayBeNumbered = (file: string): boolean => mayBeNumberedName(file, takenFiles);
   // A moved/renamed file is matched by id below, and only the entry above
   // knows what its envelope said.
   const recordedTitles = new Map(
@@ -354,14 +361,13 @@ export async function buildPushPlan(
     // the title is the first line and the key would be a second source of
     // truth, so it isn't read at all. A removed key is a request too - see
     // `titleKeyIntent`.
-    const titleKey = titleKeyIntent(frontmatter, entry, filenameAsTitle);
+    const titleKey = titleKeyIntent(readNoteTitleKey(frontmatter), entry, entry.file, { filenameAsTitle, nameMayBeNumbered });
     const { requestedTitle, recordedTitle: statedTitle } = titleKey;
+    if (titleKey.notice !== undefined) {
+      notices.push({ level: "warn", message: titleKey.notice });
+    }
     const titleOnly = local.status === "clean";
     if (titleOnly && statedTitle === entry.frontmatterTitle) {
-      continue;
-    }
-    if (titleKey.refusal !== undefined) {
-      entries.push({ kind: "update", file: entry.file, resolution: "refused", reason: titleKey.refusal });
       continue;
     }
 
@@ -596,6 +602,9 @@ export async function buildPushPlan(
      * (and for every in-body vault), where a file name means nothing
      * remotely and the move is metadata-only. */
     newTitle?: string | undefined;
+    /** The retitle is asked for by a removed `apple-note-title`, so undoing
+     * it means putting the key back, not renaming the file. */
+    keyRemoved: boolean;
     /** `frontmatterTitle` for state once the move lands - the moved file's
      * `apple-note-title`, so a key dropped on the way isn't read as a
      * request again by the next plan. */
@@ -660,34 +669,24 @@ export async function buildPushPlan(
     // (which is why a note can sit at "Foo 2.md" while being titled "Foo")
     // never leaks into a title.
     // The envelope travels with the file, so `apple-note-title` is still
-    // the right answer after a move - see `titleExpressedByFile`.
-    // A key the last sync recorded that the moved file no longer carries
-    // asks for the name's title even when the name didn't change, exactly as
-    // it does for a note left in place (see `titleKeyIntent`) - and, as
-    // there, not when that name may be one pull numbered. A key that can't
-    // be read asks for nothing and leaves state's record as it was.
-    const titleKey = titleKeys.get(pair.toFile) ?? { kind: "unreadable" };
-    const removedKey = titleMode === "filename" && pair.entry.frontmatterTitle !== undefined && titleKey.kind === "absent";
-    const renamed = path.posix.basename(pair.toFile) !== path.posix.basename(pair.entry.file);
-    if (removedKey && !renamed && hasCollisionSuffix(pair.toFile)) {
-      entries.push({ ...base, reason: removedTitleKeyRefusal(pair.toFile) });
-      continue;
+    // the right answer after a move - see `titleExpressedByFile` and
+    // `moveTitleIntent`.
+    const titleIntent = moveTitleIntent(
+      pair,
+      { titleKey: titleKeys.get(pair.toFile) ?? { kind: "unmarked" }, noteId: noteIds.get(pair.toFile) },
+      recordedTitles,
+      { filenameAsTitle, nameMayBeNumbered },
+    );
+    if (titleIntent.notice !== undefined) {
+      notices.push({ level: "warn", message: titleIntent.notice });
     }
-    const previousTitle = titleFromNoteFileName(pair.entry.file);
-    const newTitle = titleExpressedByFile(pair.toFile, recordedTitles);
-    const retitled = titleMode === "filename" && (newTitle !== previousTitle || removedKey);
-    const recordedTitle =
-      titleMode !== "filename" || titleKey.kind === "unreadable"
-        ? pair.entry.frontmatterTitle
-        : titleKey.kind === "stated"
-          ? titleKey.title
-          : undefined;
     readyMovePairs.push({
       ...pair,
       folderRecordName: info.folderRecordName as string,
       relocated,
-      newTitle: retitled ? newTitle : undefined,
-      recordedTitle,
+      newTitle: titleIntent.newTitle,
+      keyRemoved: titleIntent.keyRemoved,
+      recordedTitle: titleIntent.recordedTitle,
     });
   }
 
@@ -1788,16 +1787,23 @@ async function prepareEmbedCandidate(
  */
 export function prepareRetitle(
   record: CloudKitRecord,
-  pair: { entry: CloneStateNoteEntry; toFile: string; newTitle?: string | undefined },
+  pair: { entry: CloneStateNoteEntry; toFile: string; newTitle?: string | undefined; keyRemoved?: boolean | undefined },
   replicaId: Uint8Array,
   titleMode: TitleMode,
 ):
   | { ok: true; retitle: { payloadBase64: string; plainText: string } | undefined }
   | { ok: false; resolution: "refused" | "conflict"; reason: string } {
+  // Undo whatever asked for the retitle: a new name, a removed key, or both.
+  const oldName = path.posix.basename(pair.entry.file);
+  const renamed = path.posix.basename(pair.toFile) !== oldName;
+  const undo =
+    pair.keyRemoved === true
+      ? `put "${NOTE_TITLE_KEY}" back${renamed ? ` and rename the file back to ${oldName}` : ""}`
+      : `rename the file back to ${oldName}`;
   const refused = (reason: string): { ok: false; resolution: "refused"; reason: string } => ({
     ok: false,
     resolution: "refused",
-    reason: `${reason} - rename the file back to ${path.posix.basename(pair.entry.file)}, or retitle the note in Notes instead`,
+    reason: `${reason} - ${undo}, or retitle the note in Notes instead`,
   });
 
   const classified = classifyNoteRecord(record, { titleMode });
@@ -1889,50 +1895,92 @@ export function titleExpressedByFile(file: string, recordedTitles: ReadonlyMap<s
  * `recordedTitle` is what state should hold as `frontmatterTitle` once that's
  * settled, so a clean note whose two agree has nothing to push.
  *
- * Two readings are deliberately not requests. A key that can't be read (YAML
- * that doesn't parse, an empty value) is a file mid-edit, so state's value
- * stands and nothing is asked. And a removal from a file whose name ends in
- * pull's collision suffix (`Untitled 2.md`) is refused: that name may not be
- * a title anyone chose, so it isn't taken as one.
+ * Three readings are deliberately not requests. A key that can't be read
+ * (YAML that doesn't parse, an empty value) is a file mid-edit, and a file
+ * with no id-stamped envelope never said anything about the key (see
+ * `NoteTitleKey`), so in both state's value stands and nothing is asked.
+ * And a removal from a file whose name may be one pull numbered
+ * (`nameMayBeNumbered`) isn't taken as a title anyone chose: the title is
+ * left alone, state keeps the old key so the question stays open, and the
+ * `notice` says why - without holding back the rest of the note's push.
  */
 export function titleKeyIntent(
-  frontmatter: string,
+  key: NoteTitleKey,
   entry: CloneStateNoteEntry,
-  filenameAsTitle: boolean,
-): { requestedTitle?: string | undefined; recordedTitle: string | undefined; refusal?: string | undefined } {
-  if (!filenameAsTitle) {
+  file: string,
+  options: { filenameAsTitle: boolean; nameMayBeNumbered: (file: string) => boolean },
+): { requestedTitle?: string | undefined; recordedTitle: string | undefined; keyRemoved?: true; notice?: string | undefined } {
+  if (!options.filenameAsTitle) {
     return { recordedTitle: entry.frontmatterTitle };
   }
-  const key = readNoteTitleKey(frontmatter);
   switch (key.kind) {
     case "stated":
       return { requestedTitle: key.title, recordedTitle: key.title };
+    case "unmarked":
     case "unreadable":
       return { recordedTitle: entry.frontmatterTitle };
     case "absent":
       if (entry.frontmatterTitle === undefined) {
         return { recordedTitle: undefined };
       }
-      if (hasCollisionSuffix(entry.file)) {
-        return { recordedTitle: undefined, refusal: removedTitleKeyRefusal(entry.file) };
+      if (options.nameMayBeNumbered(file)) {
+        return {
+          recordedTitle: entry.frontmatterTitle,
+          notice:
+            `${file}: its "${NOTE_TITLE_KEY}" was removed, which asks for the title the file name spells - but ` +
+            `"${titleFromNoteFileName(file)}" may carry a number pull added to keep two names apart, so the ` +
+            `note keeps its title. Rename the file to the title you want, set "${NOTE_TITLE_KEY}" to it, or put the old key back.`,
+        };
       }
-      return { requestedTitle: titleFromNoteFileName(entry.file), recordedTitle: undefined };
+      return { requestedTitle: titleFromNoteFileName(file), recordedTitle: undefined, keyRemoved: true };
   }
 }
 
-function removedTitleKeyRefusal(file: string): string {
-  return (
-    `its "${NOTE_TITLE_KEY}" was removed, which asks for the title the file name spells - but ` +
-    `"${titleFromNoteFileName(file)}" may carry a number pull added to keep two names apart. ` +
-    `Rename the file to the title you want, set "${NOTE_TITLE_KEY}" to it, or put the old key back.`
+/**
+ * The title side of a local move: what the moved file asks the note to be
+ * called, and what state records as `frontmatterTitle` afterwards.
+ *
+ * A rename asks for the title the new name (or the file's
+ * `apple-note-title`) spells. A key the last sync recorded that the moved
+ * file no longer carries asks for the name's title even when the name didn't
+ * change, exactly as it does for a note left in place (see
+ * `titleKeyIntent`) - and, as there, not when the name may be one pull
+ * numbered. That's judged against where pull put it, `entry.file`, and only
+ * when the move kept the name: a name the move changed is one the user
+ * chose. Only a pair matched by id has an envelope whose missing key means
+ * anything; the fallbacks pair files that carry no usable id, and such a
+ * file never recorded a title.
+ */
+export function moveTitleIntent(
+  pair: { recordName: string; entry: CloneStateNoteEntry; toFile: string },
+  file: { titleKey: NoteTitleKey; noteId?: string | undefined },
+  recordedTitles: ReadonlyMap<string, string>,
+  options: { filenameAsTitle: boolean; nameMayBeNumbered: (file: string) => boolean },
+): { newTitle?: string | undefined; keyRemoved: boolean; recordedTitle: string | undefined; notice?: string | undefined } {
+  const renamed = path.posix.basename(pair.toFile) !== path.posix.basename(pair.entry.file);
+  const intent = titleKeyIntent(
+    file.titleKey.kind === "absent" && file.noteId !== pair.recordName ? { kind: "unmarked" } : file.titleKey,
+    pair.entry,
+    pair.toFile,
+    { filenameAsTitle: options.filenameAsTitle, nameMayBeNumbered: () => !renamed && options.nameMayBeNumbered(pair.entry.file) },
   );
+  const keyRemoved = intent.keyRemoved === true;
+  const newTitle = titleExpressedByFile(pair.toFile, recordedTitles);
+  const retitled = options.filenameAsTitle && (newTitle !== titleFromNoteFileName(pair.entry.file) || keyRemoved);
+  return { newTitle: retitled ? newTitle : undefined, keyRemoved, recordedTitle: intent.recordedTitle, notice: intent.notice };
 }
 
-/** Whether a note's file name ends the way `uniqueFileName` makes one end -
- * " 2" onwards - so the title it spells may not be the one it was named for. */
-function hasCollisionSuffix(file: string): boolean {
-  const match = / ([0-9]+)$/.exec(path.posix.basename(file, ".md"));
-  return match?.[1] !== undefined && Number(match[1]) >= 2;
+/** Whether a note's file name may be one `uniqueFileName` numbered: it ends
+ * in " 2" onwards *and* the unnumbered name is taken in the same directory,
+ * which is the only reason pull would have numbered it. A name that merely
+ * ends in a number (`Q3-Q4 2024.md`) with no such sibling is the user's. */
+function mayBeNumberedName(file: string, takenFiles: ReadonlySet<string>): boolean {
+  const match = /^(.*) ([0-9]+)$/.exec(path.posix.basename(file, ".md"));
+  if (match?.[1] === undefined || match[2] === undefined || Number(match[2]) < 2) {
+    return false;
+  }
+  const sibling = path.posix.join(path.posix.dirname(file), `${match[1]}.md`).toLowerCase();
+  return takenFiles.has(sibling);
 }
 
 /**
