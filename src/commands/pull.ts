@@ -25,7 +25,7 @@ import { buildVaultLayout, noteDirOf, placeNote, previousLayoutDirs, type Shared
 import { reconcileNotePlacements, removeStaleDirs } from "../notes/folderReconcile.js";
 import { hasConflictMarkers, mergeNoteVersions } from "../notes/mergeConflict.js";
 import { readBaseCopy, removeBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
-import { localFileState } from "../notes/localFileState.js";
+import { localFileState, readLocalNote } from "../notes/localFileState.js";
 import { writeCloneState, type CloneState, type CloneStateNoteEntry, type TitleMode } from "../notes/cloneState.js";
 import { migrationReporter, openVault } from "../notes/vaultMigrations.js";
 import { pendingRenameTarget, settlePendingRenames } from "../notes/pendingRename.js";
@@ -259,29 +259,10 @@ export async function runPull(
         // A resynced zone re-delivers *every* record, changed or not. One
         // whose change tag still matches what this vault last synced hasn't
         // moved remotely - skip it, exactly as an incremental fetch would
-        // have by never sending it. (A record with local-only edits is
-        // untouched either way: not rewriting it here is what an incremental
-        // pull already does, and `push` picks the edits up as usual.) The
-        // tag alone isn't quite enough, though: `push` and `status` can
-        // advance it without catching up the rest of the entry (see
-        // `trackedEntryMatches`), and this re-delivery is the one chance to.
-        if (
-          source.resynced &&
-          existing !== undefined &&
-          record.recordChangeTag !== undefined &&
-          record.recordChangeTag === existing.recordChangeTag &&
-          (decoded.status !== "ok" ||
-            trackedEntryMatches(
-              existing,
-              {
-                titleLine: decoded.titleLine,
-                folderRecordName: placeNote(layout, record, source.sharedZoneOwner).folderRecordName,
-                frontmatterTitle: titleNeedingFrontmatter(decoded.titleLine, titleMode),
-                unpublishableReason: decoded.unpublishableReason,
-              },
-              titleMode,
-            ))
-        ) {
+        // have by never sending it. A deleted or unsyncable record is
+        // skipped on the tag alone; a live note gets a closer look further
+        // down (see `isResyncedRecordApplied`).
+        if (source.resynced && existing !== undefined && decoded.status !== "ok" && atTrackedTag(record, existing)) {
           continue;
         }
 
@@ -349,6 +330,34 @@ export async function runPull(
                     `${representabilityProblem(recordedTitle) ?? "a file name can't carry it"}`,
                 },
               ];
+
+        // Where this note lives: a tracked note stays at its current path
+        // (even if its folder membership changed - reconciliation is a
+        // later step); a new note is placed by the current folder tree.
+        // `folderRecordName` always reflects the *current* membership.
+        const placement = placeNote(layout, record, source.sharedZoneOwner);
+        // Built once, so the two skips below can't drift apart.
+        const derived: DerivedNoteFields = {
+          titleLine: decoded.titleLine,
+          folderRecordName: placement.folderRecordName,
+          frontmatterTitle: recordedTitle,
+          unpublishableReason: decoded.unpublishableReason,
+        };
+        const renderedBody = decoded.embedSlots.length === 0 ? decoded.markdownText : undefined;
+
+        // This skip comes before the snapshot below, so a pushed version
+        // whose re-delivery happens to be a resync never enters the history.
+        // That's deliberate: a resync re-delivers every note, and snapshotting
+        // each one means reading its whole history, to cover a case
+        // (a resync landing right after a push) that's rare.
+        if (
+          source.resynced &&
+          existing !== undefined &&
+          (await isResyncedRecordApplied(targetDir, record, existing, derived, renderedBody, titleMode))
+        ) {
+          continue;
+        }
+
         // Tracks whether any per-record snapshot below actually wrote
         // something new this run - an epoch is only worth recording when it
         // is (see `recordEpoch` below).
@@ -365,12 +374,6 @@ export async function runPull(
             })) || recordedNewSnapshot;
         }
 
-        // Where this note lives: a tracked note stays at its current path
-        // (even if its folder membership changed - reconciliation is a
-        // later step); a new note is placed by the current folder tree.
-        // `folderRecordName` always reflects the *current* membership.
-        const placement = placeNote(layout, record, source.sharedZoneOwner);
-
         // The note this vault already holds at exactly this version - most
         // often one the `push` just before this pull wrote, which the
         // incremental fetch hands straight back. Rewriting it would reset the
@@ -379,20 +382,7 @@ export async function runPull(
         // where that version enters the history.
         if (
           existing !== undefined &&
-          (await isAlreadyAtTrackedVersion(
-            targetDir,
-            record,
-            existing,
-            {
-              titleLine: decoded.titleLine,
-              folderRecordName: placement.folderRecordName,
-              frontmatterTitle: recordedTitle,
-              unpublishableReason: decoded.unpublishableReason,
-            },
-            decoded.embedSlots.length === 0 ? decoded.markdownText : undefined,
-            titleMode,
-            tableAttachments,
-          ))
+          (await isAlreadyAtTrackedVersion(targetDir, record, existing, derived, renderedBody, titleMode, tableAttachments))
         ) {
           if (recordedNewSnapshot) {
             await recordEpoch(targetDir, record.recordName, [record.recordName]);
@@ -785,25 +775,68 @@ export function trackedEntryMatches(existing: CloneStateNoteEntry, derived: Deri
   return titleMode !== "filename" || fileNameCarriesTitle(path.posix.basename(existing.file), derived.titleLine);
 }
 
+/** Whether a delivered record carries the change tag this vault last synced. */
+function atTrackedTag(record: CloudKitRecord, existing: CloneStateNoteEntry): boolean {
+  return record.recordChangeTag !== undefined && record.recordChangeTag === existing.recordChangeTag;
+}
+
+/**
+ * Whether the base copy is pull's own rendering of the record.
+ *
+ * `push` makes this check necessary. It writes the text the user typed as the
+ * base copy, and pull's rendering of the same note can differ cosmetically
+ * (`* item` against `- item`). The re-delivery right after a push is what
+ * replaces that base with pull's rendering; skip it, and the next remote edit
+ * diffs against a base in the wrong notation and conflicts on lines nobody
+ * touched.
+ */
+async function baseCopyIsRendering(targetDir: string, recordName: string, renderedBody: string): Promise<boolean> {
+  return (await readBaseCopy(targetDir, recordName)) === renderedBody;
+}
+
+/**
+ * Whether a note a resync re-delivered is already applied, so it can be
+ * skipped as an incremental fetch would have skipped it by never sending it:
+ * its change tag is the one tracked, the entry matches (see
+ * `trackedEntryMatches`), and the base copy is pull's rendering of it (see
+ * `baseCopyIsRendering`).
+ *
+ * Looser than `isAlreadyAtTrackedVersion` on purpose. A note with local
+ * edits, a missing file, or tables is still skipped here, because an
+ * incremental pull that never saw the record wouldn't touch any of those
+ * either; `push` picks local edits up as usual. A note with embeds
+ * (`renderedBody` undefined) skips on the entry alone, since checking its
+ * base would mean resolving its attachments.
+ */
+export async function isResyncedRecordApplied(
+  targetDir: string,
+  record: CloudKitRecord,
+  existing: CloneStateNoteEntry,
+  derived: DerivedNoteFields,
+  renderedBody: string | undefined,
+  titleMode: TitleMode,
+): Promise<boolean> {
+  if (!atTrackedTag(record, existing) || !trackedEntryMatches(existing, derived, titleMode)) {
+    return false;
+  }
+  return renderedBody === undefined || (await baseCopyIsRendering(targetDir, record.recordName, renderedBody));
+}
+
 /**
  * Whether applying a delivered record would only rewrite what this vault
  * already holds: its change tag is the one tracked, the entry matches (see
  * `trackedEntryMatches`), and the base copy is already pull's own rendering
- * of the record.
+ * of the record (see `baseCopyIsRendering`). `renderedBody` is undefined when
+ * the record has embeds, since rendering those means resolving attachments,
+ * so such a record always takes the normal path.
  *
- * That last check is the one `push` makes necessary. It writes the text the
- * user typed as the base copy, and pull's rendering of the same note can
- * differ cosmetically (`* item` against `- item`). The re-delivery right
- * after a push is what replaced that base with pull's rendering; skip it,
- * and the next remote edit diffs against a base in the wrong notation and
- * conflicts on lines nobody touched. `renderedBody` is undefined when the
- * record has embeds, since rendering those means resolving attachments, so
- * such a record always takes the normal path.
- *
- * Also never skipped: a missing file (pull recreates it), a file still
- * carrying conflict markers (pull is where those are reported), and a note
- * with tables, whose snapshots are taken while resolving the attachments -
- * `push` doesn't record the table bytes it uploads either.
+ * Also never skipped: a missing file (pull recreates it), and a note with
+ * tables, whose snapshots are taken while resolving the attachments - `push`
+ * doesn't record the table bytes it uploads either. A modified file carrying
+ * conflict markers isn't skipped either, as a safety net: the markers
+ * icloud-md writes itself leave the old base copy behind, so those fail the
+ * base check first, and what's left is markers that came from somewhere
+ * else, which the normal path reports.
  */
 export async function isAlreadyAtTrackedVersion(
   targetDir: string,
@@ -814,29 +847,20 @@ export async function isAlreadyAtTrackedVersion(
   titleMode: TitleMode,
   tableAttachments: NonNullable<CloneState["tableAttachments"]>,
 ): Promise<boolean> {
-  if (record.recordChangeTag === undefined || record.recordChangeTag !== existing.recordChangeTag) {
-    return false;
-  }
-  if (!trackedEntryMatches(existing, derived, titleMode)) {
+  if (!atTrackedTag(record, existing) || !trackedEntryMatches(existing, derived, titleMode)) {
     return false;
   }
   if (Object.values(tableAttachments).some((entry) => entry.noteRecordName === record.recordName)) {
     return false;
   }
-  if (renderedBody === undefined || (await readBaseCopy(targetDir, record.recordName)) !== renderedBody) {
+  if (renderedBody === undefined || !(await baseCopyIsRendering(targetDir, record.recordName, renderedBody))) {
     return false;
   }
-  const local = await localFileState(targetDir, existing, record.recordName, titleMode);
-  if (local === "missing") {
+  const local = await readLocalNote(targetDir, existing, record.recordName, titleMode);
+  if (local.status === "missing") {
     return false;
   }
-  if (local === "modified") {
-    const { body } = splitFrontmatter(await readFile(path.join(targetDir, existing.file), "utf-8"), {
-      filenameAsTitle: titleMode === "filename",
-    });
-    return !hasConflictMarkers(body);
-  }
-  return true;
+  return local.status === "clean" || !hasConflictMarkers(local.body);
 }
 
 /**

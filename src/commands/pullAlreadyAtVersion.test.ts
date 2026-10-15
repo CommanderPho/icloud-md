@@ -6,7 +6,7 @@ import path from "node:path";
 import { writeBaseCopy } from "../notes/baseCopy.js";
 import type { CloudKitRecord } from "../cloudkit/databaseClient.js";
 import type { CloneStateNoteEntry } from "../notes/cloneState.js";
-import { isAlreadyAtTrackedVersion, trackedEntryMatches, type DerivedNoteFields } from "./pull.js";
+import { isAlreadyAtTrackedVersion, isResyncedRecordApplied, trackedEntryMatches, type DerivedNoteFields } from "./pull.js";
 
 // The record `push` just wrote comes straight back on the next incremental
 // pull. When nothing about it differs from what the vault tracks, pull must
@@ -190,10 +190,9 @@ test("a note with tables isn't skipped - their snapshots are taken while resolvi
     );
   }));
 
-// A resync re-delivers every record and skips the ones at their tracked tag
-// on the entry alone - their text is whatever the vault already settled on.
-// The entry still has to match, or a folder move `status` adopted would
-// never reach the file.
+// A resync re-delivers every record and skips the ones already applied. The
+// entry still has to match, or a folder move `status` adopted would never
+// reach the file.
 
 test("the resync skip still requires the tracked entry to match", () => {
   assert.equal(trackedEntryMatches(entry(), derived(), "in-body"), true);
@@ -201,3 +200,36 @@ test("the resync skip still requires the tracked entry to match", () => {
   assert.equal(trackedEntryMatches(entry(), derived({ titleLine: "Shopping" }), "filename"), false);
   assert.equal(trackedEntryMatches(entry(), derived({ titleLine: "Shopping" }), "in-body"), true);
 });
+
+test("a resynced record at the tracked tag with nothing else changed is skipped", () =>
+  withTempDir(async (dir) => {
+    await writeCleanNote(dir, "Notes/Groceries.md", BODY);
+    assert.equal(await isResyncedRecordApplied(dir, record("2b"), entry(), derived(), BODY, "in-body"), true);
+    assert.equal(await isResyncedRecordApplied(dir, record("3c"), entry(), derived(), BODY, "in-body"), false);
+    assert.equal(
+      await isResyncedRecordApplied(dir, record("2b"), entry(), derived({ folderRecordName: "FOLDER-2" }), BODY, "in-body"),
+      false,
+    );
+  }));
+
+// The resync right after a push is the same re-delivery the incremental skip
+// guards: if it's skipped while the base copy is still in the user's
+// notation, the next remote edit conflicts on lines nobody touched.
+
+test("a resynced record isn't skipped while the base copy is in the user's notation rather than pull's", () =>
+  withTempDir(async (dir) => {
+    await writeCleanNote(dir, "Notes/Groceries.md", "Groceries\n* milk\n");
+    assert.equal(await isResyncedRecordApplied(dir, record("2b"), entry(), derived(), "Groceries\n- milk\n", "in-body"), false);
+  }));
+
+// Looser than the incremental skip: an incremental pull that never saw the
+// record wouldn't touch local edits, a missing file, or a note with embeds.
+
+test("a resynced record is skipped despite local edits, a missing file, or embeds", () =>
+  withTempDir(async (dir) => {
+    await writeBaseCopy(dir, RECORD_NAME, BODY);
+    assert.equal(await isResyncedRecordApplied(dir, record("2b"), entry(), derived(), BODY, "in-body"), true);
+    await writeCleanNote(dir, "Notes/Groceries.md", "Groceries\n* milk\n");
+    await writeFile(path.join(dir, "Notes/Groceries.md"), "Groceries\n* milk\n* eggs\n", "utf-8");
+    assert.equal(await isResyncedRecordApplied(dir, record("2b"), entry(), derived(), undefined, "in-body"), true);
+  }));
