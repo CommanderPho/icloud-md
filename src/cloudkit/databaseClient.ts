@@ -257,7 +257,10 @@ export async function fetchZoneNoteRecords(
       onPage?.(pageRecords.length);
     }
 
-    return { records: dedupeZoneRecords(records), syncToken };
+    return {
+      records: await dedupeWalkRecords(records, `fetchZoneNoteRecords (${database} zone ${zoneID.ownerRecordName ?? "Notes"})`),
+      syncToken,
+    };
   };
 
   if (sinceSyncToken === undefined) {
@@ -318,7 +321,7 @@ export async function fetchAllZoneRecords(
     onPage?.((zone.records ?? []).length);
   }
 
-  return dedupeZoneRecords(records);
+  return dedupeWalkRecords(records, "fetchAllZoneRecords");
 }
 
 /**
@@ -329,41 +332,66 @@ export async function fetchAllZoneRecords(
  * untracked - and the next push creates it in iCloud as a brand-new note.
  *
  * Callers pass one zone's records, so `recordName` is the key: the same name
- * in another zone is a different record and is never collapsed here. The
- * occurrence with the greater `modified.timestamp` wins when both carry one
- * and they differ; otherwise the later one does, since a later page is a
- * later read of the server. That covers a tombstone (no `modified`) listed
- * after a live copy. Change tags are opaque rather than ordered, so they are
- * never compared. The winner takes the first occurrence's position, keeping
- * file naming in listing order of first appearance.
+ * in another zone is a different record and is never collapsed here. Which
+ * occurrence wins doesn't depend on listing order:
+ *
+ * - A tombstone beats any live copy. A deleted record doesn't come back under
+ *   the same name, so a deletion seen anywhere in the walk is the newest
+ *   state of that record.
+ * - Between live copies, the greater `modified.timestamp` wins, and a copy
+ *   without one ranks below any copy that has one.
+ * - Only an exact tie falls back to position, and goes to the later
+ *   occurrence. Private walks send `reverse: true`, and nothing captured so
+ *   far shows which way that orders a repeat, so "later" here is a tiebreak,
+ *   not evidence of recency.
+ *
+ * Change tags are opaque rather than ordered, so they are never compared. The
+ * winner takes the first occurrence's position, keeping file naming in
+ * listing order of first appearance.
  *
  * Ported from ferdousbhai/icloud-for-omarchy@fc242a5.
  */
 export function dedupeZoneRecords(records: CloudKitRecord[]): CloudKitRecord[] {
-  const indexByName = new Map<string, number>();
-  const deduped: CloudKitRecord[] = [];
+  // Map.set on an existing key keeps that key's original insertion position.
+  const winners = new Map<string, CloudKitRecord>();
   for (const record of records) {
-    const at = indexByName.get(record.recordName);
-    if (at === undefined) {
-      indexByName.set(record.recordName, deduped.length);
-      deduped.push(record);
-      continue;
-    }
-    const kept = deduped[at];
-    if (kept === undefined || supersedes(record, kept)) {
-      deduped[at] = record;
+    const kept = winners.get(record.recordName);
+    if (kept === undefined || recencyRank(record) >= recencyRank(kept)) {
+      winners.set(record.recordName, record);
     }
   }
-  return deduped;
+  return [...winners.values()];
 }
 
-/** Whether `later`, listed after `kept` in the same walk, replaces it; see
- * `dedupeZoneRecords`. */
-function supersedes(later: CloudKitRecord, kept: CloudKitRecord): boolean {
-  if (later.modified !== undefined && kept.modified !== undefined && later.modified.timestamp !== kept.modified.timestamp) {
-    return later.modified.timestamp > kept.modified.timestamp;
+/** How recent an occurrence is for `dedupeZoneRecords`: tombstones first,
+ * then live copies by `modified.timestamp`, with no timestamp lowest. */
+function recencyRank(record: CloudKitRecord): number {
+  if (record.deleted === true) {
+    return Number.POSITIVE_INFINITY;
   }
-  return true;
+  return record.modified?.timestamp ?? Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * `dedupeZoneRecords` for a finished walk, logging any record it collapsed.
+ * We haven't yet seen CloudKit repeat a record on a real account, so the
+ * debug log is the only evidence a repeat leaves behind once it's collapsed -
+ * including for anyone chasing issue #32 with `object list`.
+ */
+async function dedupeWalkRecords(records: CloudKitRecord[], context: string): Promise<CloudKitRecord[]> {
+  const deduped = dedupeZoneRecords(records);
+  if (deduped.length === records.length) {
+    return deduped;
+  }
+  const counts = new Map<string, number>();
+  for (const record of records) {
+    counts.set(record.recordName, (counts.get(record.recordName) ?? 0) + 1);
+  }
+  const repeats = [...counts].filter(([, count]) => count > 1).map(([name, count]) => `${name} x${count}`);
+  await appendDebugLog({
+    note: `${context}: collapsed ${records.length - deduped.length} repeated record listing(s) in one walk: ${repeats.join(", ")}`,
+  });
+  return deduped;
 }
 
 /** Fetches records in the account's own (private-database) Notes zone. */

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -87,14 +87,39 @@ test("dedupeZoneRecords keeps the occurrence with the newer modified timestamp, 
   assert.deepEqual(dedupeZoneRecords([newer, older]), [newer]);
 });
 
-test("dedupeZoneRecords falls back to the later occurrence when timestamps tie or are missing", () => {
+test("dedupeZoneRecords falls back to the later occurrence only on an exact tie", () => {
   assert.deepEqual(dedupeZoneRecords([record("n", "a", 1_000), record("n", "b", 1_000)]), [record("n", "b", 1_000)]);
-  assert.deepEqual(dedupeZoneRecords([record("n", "a"), record("n", "b", 5)]), [record("n", "b", 5)]);
-  assert.deepEqual(dedupeZoneRecords([record("n", "a", 5), record("n", "b")]), [record("n", "b")]);
+  assert.deepEqual(dedupeZoneRecords([record("n", "a"), record("n", "b")]), [record("n", "b")]);
 });
 
-test("dedupeZoneRecords lets a tombstone listed after a live copy win", () => {
+test("dedupeZoneRecords ranks a live copy without a timestamp below one with a timestamp, in either order", () => {
+  assert.deepEqual(dedupeZoneRecords([record("n", "a"), record("n", "b", 5)]), [record("n", "b", 5)]);
+  assert.deepEqual(dedupeZoneRecords([record("n", "a", 5), record("n", "b")]), [record("n", "a", 5)]);
+});
+
+test("dedupeZoneRecords lets a tombstone win over a live copy, in either order", () => {
   assert.deepEqual(dedupeZoneRecords([record("n", "a", 1_000), tombstone("n")]), [tombstone("n")]);
+  assert.deepEqual(dedupeZoneRecords([tombstone("n"), record("n", "a", 1_000)]), [tombstone("n")]);
+});
+
+test("dedupeZoneRecords picks the same winner from three copies in every listing order", () => {
+  const copies = [record("n", "newest", 5), record("n", "untimed"), record("n", "older", 3)];
+  const orders = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ];
+  for (const order of orders) {
+    const listed = order.map((index) => copies[index]).filter((entry) => entry !== undefined);
+    assert.deepEqual(
+      dedupeZoneRecords(listed).map((entry) => entry.recordChangeTag),
+      ["newest"],
+      `listing order ${order.join(",")}`,
+    );
+  }
 });
 
 test("dedupeZoneRecords puts the winner at the first occurrence's position and leaves distinct records alone", () => {
@@ -148,6 +173,21 @@ test("fetchAllZoneRecords collapses a repeated record too", async () => {
   } finally {
     restore();
   }
+});
+
+test("a walk that collapses a repeat records it in the debug log", async () => {
+  const restore = installFetchMock([
+    zonePage([wireNote("note-repeated", "tag-1", 1_000)], "t1", true),
+    zonePage([wireNote("note-repeated", "tag-1", 1_000)], "t2", false),
+  ]);
+  try {
+    await fetchAllZoneRecords(session, "https://ckdatabasews.example", "12345");
+  } finally {
+    restore();
+  }
+
+  const log = await readFile(path.join(scratchHome, ".config", "icloud-md", "debug.log"), "utf8");
+  assert.match(log, /fetchAllZoneRecords: collapsed 1 repeated record listing\(s\) in one walk: note-repeated x2/);
 });
 
 test("fetchSharedZoneIds returns a zone listed on two pages once", async () => {
