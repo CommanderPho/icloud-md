@@ -61,7 +61,11 @@ icloud-md push
   three-way merge and only asks you to resolve the parts that actually
   overlap — the rest merges automatically. A note you edited locally but
   deleted on another device keeps your edits: `pull` stops tracking it, and
-  the next `push` creates it again as a new note.
+  the next `push` creates it again as a new note (delete the file first if
+  you don't want it back). That includes a note someone else deleted from a
+  shared folder you can write to: it comes back in their folder. Where you
+  can't create notes, such as a read-only shared folder, `push` says so, and
+  you can move the file into one of your own folders.
 - **`git`-flavored CLI**: You're probably already familiar with what the
   various `git` commands do; that knowledge is most of what you need to
   know to use this tool.

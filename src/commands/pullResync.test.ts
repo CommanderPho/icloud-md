@@ -7,8 +7,12 @@ import { readBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
 import { writeCloneState, type CloneState, type CloneStateNoteEntry } from "../notes/cloneState.js";
 import { splitFrontmatter } from "../notes/frontmatter.js";
 import { readNoteId, readNoteTitle } from "../notes/noteIdFrontmatter.js";
+import { uniqueFileName } from "../notes/filename.js";
+import { buildInitialNoteDocument, encodeNoteDocument } from "../notes/noteDocument.js";
+import { compressNoteDocument } from "../notes/noteText.js";
+import { recordVersion } from "../notes/versionHistory.js";
 import { UnboundAccountError } from "../errors.js";
-import { reconcileNotesAfterResync, type PullSummary } from "./pull.js";
+import { reconcileNotesAfterResync, usedAttachmentNamesFor, type PullSummary } from "./pull.js";
 import { buildPushPlan } from "./push.js";
 
 /** Ids have to be UUID-shaped, or `readNoteId` ignores them. */
@@ -107,7 +111,12 @@ test("an absent note with local edits is kept as a new note: untracked, id clear
         kind: "untrack",
         file: "Notes/Edited.md",
         remarks: [
-          { tone: "note", message: "deleted on another device, but has local edits - kept as a new note, which the next push creates" },
+          {
+            tone: "note",
+            message:
+              "deleted on another device, but has local edits - kept as a new note; " +
+              "the next push creates it - delete the file first if you don't want it back",
+          },
         ],
       },
     ]);
@@ -179,6 +188,91 @@ test("the next push plans a kept note as a create instead of refusing it", () =>
     // every local gate - no conflict-marker or "no longer exists remotely"
     // refusal - and the plan went on to need a session for the create.
     await assert.rejects(() => buildPushPlan(dir), UnboundAccountError);
+  }));
+
+test("a note with no base copy is kept too, and the remark says it may not have been edited", () =>
+  withTempDir(async (dir) => {
+    await writeVaultFile(dir, "Notes/Unknown.md", "body\n");
+    const notes: CloneState["notes"] = { "REC-UNKNOWN": entryFor("Notes/Unknown.md") };
+    const summary = emptySummary();
+
+    await reconcileNotesAfterResync(dir, undefined, new Set(), notes, {}, {}, summary, "in-body");
+
+    assert.equal(notes["REC-UNKNOWN"], undefined);
+    assert.equal(await fileExists(dir, "Notes/Unknown.md"), true);
+    assert.equal(summary.changes[0]?.kind, "untrack");
+    assert.match(summary.changes[0]?.remarks?.[0]?.message ?? "", /last synced copy is missing, so it may have local edits/);
+  }));
+
+test("a kept note from someone else's area says push may not be able to recreate it there", () =>
+  withTempDir(async (dir) => {
+    await writeVaultFile(dir, "Shared/Theirs.md", "body plus my local edit\n");
+    await writeBaseCopy(dir, "REC-THEIRS", "body\n");
+    const notes: CloneState["notes"] = { "REC-THEIRS": entryFor("Shared/Theirs.md", "_sharer") };
+    const summary = emptySummary();
+
+    await reconcileNotesAfterResync(dir, "_sharer", new Set(), notes, {}, {}, summary, "in-body");
+
+    assert.equal(notes["REC-THEIRS"], undefined);
+    assert.match(summary.changes[0]?.remarks?.[0]?.message ?? "", /move it into one of your own folders/);
+  }));
+
+/** Records `text` as the last version pull saw of `recordName`, encoded the
+ * way a real Note's `TextDataEncrypted` is. */
+async function recordNoteText(dir: string, recordName: string, text: string): Promise<void> {
+  const doc = buildInitialNoteDocument(text, new Uint8Array(16).fill(7));
+  await recordVersion(dir, {
+    recordName,
+    recordType: "Note",
+    field: "TextDataEncrypted",
+    recordChangeTag: "1a",
+    valueBase64: compressNoteDocument(encodeNoteDocument(doc)).toString("base64"),
+  });
+}
+
+test("a kept note at a uniquified file name records its real title, so push doesn't create it as \"Groceries 2\"", () =>
+  withTempDir(async (dir) => {
+    await writeVaultFile(dir, "Notes/Groceries 2.md", "milk plus eggs\n");
+    await writeBaseCopy(dir, "REC-GROCERIES", "milk\n");
+    await recordNoteText(dir, "REC-GROCERIES", "Groceries\nmilk");
+    const notes: CloneState["notes"] = { "REC-GROCERIES": entryFor("Notes/Groceries 2.md") };
+
+    await reconcileNotesAfterResync(dir, undefined, new Set(), notes, {}, {}, emptySummary(), "filename");
+
+    const { frontmatter, body } = splitFrontmatter(await readFile(path.join(dir, "Notes/Groceries 2.md"), "utf-8"), {
+      filenameAsTitle: true,
+    });
+    // Push takes a create's title from `apple-note-title` before the file name.
+    assert.equal(readNoteTitle(frontmatter), "Groceries");
+    assert.equal(body, "milk plus eggs\n");
+  }));
+
+test("a kept note genuinely titled like a uniquified name gets no recorded title", () =>
+  withTempDir(async (dir) => {
+    await writeVaultFile(dir, "Notes/Groceries 2.md", "milk plus eggs\n");
+    await writeBaseCopy(dir, "REC-GROCERIES", "milk\n");
+    await recordNoteText(dir, "REC-GROCERIES", "Groceries 2\nmilk");
+    const notes: CloneState["notes"] = { "REC-GROCERIES": entryFor("Notes/Groceries 2.md") };
+
+    await reconcileNotesAfterResync(dir, undefined, new Set(), notes, {}, {}, emptySummary(), "filename");
+
+    assert.equal(await readFile(path.join(dir, "Notes/Groceries 2.md"), "utf-8"), "milk plus eggs\n");
+  }));
+
+test("attachment names already on disk count as taken, so a download can't land on a kept note's untracked file", () =>
+  withTempDir(async (dir) => {
+    await writeVaultFile(dir, "Notes/attachments/image.png", "the last copy");
+    const byDir = new Map<string, Set<string>>([["Notes", new Set(["tracked.png"])]]);
+    const scanned = new Set<string>();
+
+    const names = await usedAttachmentNamesFor(dir, byDir, scanned, "Notes");
+
+    assert.deepEqual([...names].sort(), ["image.png", "tracked.png"]);
+    assert.equal(uniqueFileName("image.png", names), "image 2.png");
+    // A directory with no attachments/ at all is fine, and nothing is listed twice.
+    assert.deepEqual([...(await usedAttachmentNamesFor(dir, byDir, scanned, "Elsewhere"))], []);
+    names.delete("image.png");
+    assert.equal((await usedAttachmentNamesFor(dir, byDir, scanned, "Notes")).has("image.png"), false);
   }));
 
 test("reconciliation is scoped to one zone: the private pass never touches shared-zone notes, nor one sharer's pass another's", () =>
