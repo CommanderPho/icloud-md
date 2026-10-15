@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fileExists } from "../fsUtil.js";
 import { carriedTitleSpelling, encodeTitleStem, titleIsRepresentable } from "./titleFilename.js";
 
 /**
@@ -118,5 +119,24 @@ export function uniqueFileName(fileName: string, usedFileNames: ReadonlySet<stri
     n += 1;
     candidate = `${stem} ${n}${ext}`;
   }
+  return candidate;
+}
+
+/**
+ * `uniqueFileName` for a name about to be written into `dirPath`: also steers
+ * clear of anything already on disk there, then claims the result in
+ * `usedFileNames`. Tracked names alone aren't enough wherever pull writes or
+ * moves a file - a file the user created and hasn't pushed is untracked, and
+ * a plain `writeFile`/`rename` onto its name destroys it. Names found taken on
+ * disk are claimed too, so later calls in the same run skip them without
+ * another stat.
+ */
+export async function claimFreeFileName(dirPath: string, fileName: string, usedFileNames: Set<string>): Promise<string> {
+  let candidate = uniqueFileName(fileName, usedFileNames);
+  while (await fileExists(path.join(dirPath, candidate))) {
+    usedFileNames.add(candidate);
+    candidate = uniqueFileName(fileName, usedFileNames);
+  }
+  usedFileNames.add(candidate);
   return candidate;
 }

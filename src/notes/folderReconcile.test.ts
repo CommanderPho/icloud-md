@@ -118,6 +118,27 @@ test("a basename collision in the target directory uniquifies and stays consiste
     assert.equal(await readFile(path.join(root, "Beta/Pie 2.md"), "utf-8"), "moving");
   }));
 
+test("a relocation never lands on an untracked file in the target directory", () =>
+  withTempDir(async (root) => {
+    const layout = buildVaultLayout(
+      [folderRecord("DefaultFolder-CloudKit", "Notes"), folderRecord("A", "Alpha"), folderRecord("B", "Beta")],
+      [],
+    );
+    const notes: CloneState["notes"] = {
+      REC: { file: "Alpha/Pie.md", recordChangeTag: "a", modificationDate: 1, folderRecordName: "B" },
+    };
+    await writeVaultFile(root, "Alpha/Pie.md", "moving");
+    // Not tracked - the user made it in Beta and hasn't pushed it.
+    await writeVaultFile(root, "Beta/Pie.md", "MINE, UNTRACKED");
+
+    const relocations = await reconcileNotePlacements(root, layout, notes, {});
+
+    assert.deepEqual(relocations, [{ from: "Alpha/Pie.md", to: "Beta/Pie 2.md" }]);
+    assert.equal(notes.REC?.file, "Beta/Pie 2.md");
+    assert.equal(await readFile(path.join(root, "Beta/Pie.md"), "utf-8"), "MINE, UNTRACKED");
+    assert.equal(await readFile(path.join(root, "Beta/Pie 2.md"), "utf-8"), "moving");
+  }));
+
 test("an attachment collision rewrites the note body and base copy identically", () =>
   withTempDir(async (root) => {
     const layout = buildVaultLayout(

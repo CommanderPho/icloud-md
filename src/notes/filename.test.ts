@@ -1,6 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fileNameCarriesTitle, noteFileName, noteFileNameFor, titleNeedingFrontmatter, uniqueFileName } from "./filename.js";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  claimFreeFileName,
+  fileNameCarriesTitle,
+  noteFileName,
+  noteFileNameFor,
+  titleNeedingFrontmatter,
+  uniqueFileName,
+} from "./filename.js";
 
 test("noteFileName derives a plain name from the title's first line", () => {
   assert.equal(noteFileName("Grocery list\nmilk, eggs"), "Grocery list.md");
@@ -26,6 +36,21 @@ test("uniqueFileName appends a Finder-style counter on collision", () => {
 test("uniqueFileName keeps counting past multiple collisions", () => {
   const used = new Set(["New Note.md", "New Note 2.md", "New Note 3.md"]);
   assert.equal(uniqueFileName("New Note.md", used), "New Note 4.md");
+});
+
+test("claimFreeFileName skips names taken on disk as well as claimed ones, and claims its answer", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "filename-test-"));
+  try {
+    await writeFile(path.join(dir, "New Note 2.md"), "untracked", "utf-8");
+    // A directory squatting on a name is just as taken as a file.
+    await mkdir(path.join(dir, "New Note 3.md"));
+    const used = new Set(["New Note.md"]);
+
+    assert.equal(await claimFreeFileName(dir, "New Note.md", used), "New Note 4.md");
+    assert.deepEqual([...used].sort(), ["New Note 2.md", "New Note 3.md", "New Note 4.md", "New Note.md"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("fileNameCarriesTitle accepts the name a title derives", () => {

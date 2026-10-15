@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import {
@@ -18,7 +18,7 @@ import {
 import { classifyNoteRecord } from "../notes/decodeNoteRecord.js";
 import { NotClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import { isEnoent } from "../fsUtil.js";
-import { fileNameCarriesTitle, noteFileNameFor, titleNeedingFrontmatter, uniqueFileName } from "../notes/filename.js";
+import { claimFreeFileName, fileNameCarriesTitle, noteFileNameFor, titleNeedingFrontmatter } from "../notes/filename.js";
 import { representabilityProblem } from "../notes/titleFilename.js";
 import { joinFrontmatter, splitFrontmatter } from "../notes/frontmatter.js";
 import { buildVaultLayout, noteDirOf, placeNote, previousLayoutDirs, type SharedZoneRecords } from "../notes/folderLayout.js";
@@ -419,10 +419,7 @@ export async function runPull(
         }
 
         if (!existing) {
-          const usedInDir = usedNamesFor(usedFileNames, noteDir);
-          const fileName = uniqueFileName(noteFileNameFor(decoded.titleLine, titleMode), usedInDir);
-          usedInDir.add(fileName);
-          const relativeFile = path.posix.join(noteDir, fileName);
+          const relativeFile = await newNoteFile(targetDir, noteDir, decoded.titleLine, titleMode, usedFileNames);
 
           const filePath = path.join(targetDir, relativeFile);
           await writeFile(
@@ -705,6 +702,29 @@ async function backfillSharePermissions(
 }
 
 /**
+ * Where a note new to this vault lands: its title-derived name in `noteDir`,
+ * uniquified against this run's claimed names *and* what is on disk. The disk
+ * check is the point - a file the user created locally and hasn't pushed is
+ * untracked, and a remote note that merely shares its title must not be
+ * written over it ("Groceries.md" stays, the remote one becomes
+ * "Groceries 2.md").
+ */
+export async function newNoteFile(
+  targetDir: string,
+  noteDir: string,
+  titleLine: string,
+  titleMode: TitleMode,
+  usedFileNames: Map<string, Set<string>>,
+): Promise<string> {
+  const fileName = await claimFreeFileName(
+    path.join(targetDir, noteDir),
+    noteFileNameFor(titleLine, titleMode),
+    usedNamesFor(usedFileNames, noteDir),
+  );
+  return path.posix.join(noteDir, fileName);
+}
+
+/**
  * Renames a tracked note's file when the note's title changed remotely and
  * this vault carries titles in file names, returning the path it now lives
  * at (unchanged in every other case).
@@ -719,10 +739,9 @@ async function backfillSharePermissions(
  * it no longer has would be a rename nobody could complete.
  *
  * The new name is resolved against both the names this run has claimed and
- * what is actually on disk. Tracked names alone aren't enough here the way
- * they are for a brand-new note: this writes over an existing directory, and
- * an untracked file the user put there themselves must not be destroyed by
- * a rename landing on top of it.
+ * what is actually on disk (`claimFreeFileName`), as for a brand-new note:
+ * an untracked file the user put there themselves must not be destroyed by a
+ * rename landing on top of it.
  */
 export async function renameForRemoteTitle(
   targetDir: string,
@@ -744,12 +763,7 @@ export async function renameForRemoteTitle(
   // renamed away from.
   usedInDir.delete(currentName);
 
-  let wanted = uniqueFileName(noteFileNameFor(titleLine, titleMode), usedInDir);
-  while (await fileExists(path.join(targetDir, dir, wanted))) {
-    usedInDir.add(wanted);
-    wanted = uniqueFileName(noteFileNameFor(titleLine, titleMode), usedInDir);
-  }
-  usedInDir.add(wanted);
+  const wanted = await claimFreeFileName(path.join(targetDir, dir), noteFileNameFor(titleLine, titleMode), usedInDir);
 
   if (defer) {
     // The old name is still occupied - by this very file, which isn't going
@@ -763,18 +777,6 @@ export async function renameForRemoteTitle(
     await rename(path.join(targetDir, currentFile), path.join(targetDir, newFile));
   }
   return { file: newFile };
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-  try {
-    await stat(filePath);
-    return true;
-  } catch (cause) {
-    if (isEnoent(cause)) {
-      return false;
-    }
-    throw cause;
-  }
 }
 
 /** The remarks a change carries, or nothing at all - the field stays absent
