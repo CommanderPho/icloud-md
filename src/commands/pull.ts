@@ -35,6 +35,7 @@ import { applyNoteFileTimes, modificationDateOf } from "../notes/noteTimestamps.
 import { recordVersion } from "../notes/versionHistory.js";
 import type { SyncNotice, SyncProgress } from "../progress.js";
 import { isPurged } from "./delete.js";
+import { backfillNewPrivateNoteBodies } from "./privateNoteBodies.js";
 
 const PRIVATE_NOTES_ZONE = { zoneName: "Notes" };
 
@@ -142,6 +143,7 @@ export async function runPull(
     onPage,
   );
   await backfillSharePermissions(auth.session, auth.ckdatabasewsUrl, auth.dsid, state.folders ?? {}, sharedZones);
+  const heldBack = await backfillNewPrivateNoteBodies(auth.session, auth.ckdatabasewsUrl, auth.dsid, records, state.notes);
 
   const notes: CloneState["notes"] = { ...state.notes };
   const attachments: NonNullable<CloneState["attachments"]> = { ...state.attachments };
@@ -231,6 +233,15 @@ export async function runPull(
     });
   }
 
+  if (heldBack.length > 0) {
+    summary.notices.push({
+      level: "warn",
+      message:
+        `${heldBack.length} new note(s) came through without their text, even when looked up - they were skipped, ` +
+        "and this vault's sync token was kept where it was so the next pull looks for them again",
+    });
+  }
+
   // Rebuild the directory layout from carried state + this run's folder
   // records: new folders (own or shared) materialize as directories, a
   // renamed folder gets a freshly derived directory name, and everything
@@ -289,8 +300,10 @@ export async function runPull(
           // listings omit bodies; a lookup backfill can fail). Untracking on
           // it would sever the sync relationship over a transient gap, so a
           // tracked note is left exactly as it is; the shared-database fetch
-          // already holds back whole zones with missing bodies, so this is
-          // the last line of defense, not the usual path.
+          // already holds back whole zones with missing bodies, and a new
+          // private note is looked up and held back for (see
+          // `backfillNewPrivateNoteBodies`), so this is the last line of
+          // defense, not the usual path.
           if (decoded.reason === "missing-body") {
             if (existing) {
               summary.notices.push({
@@ -644,7 +657,12 @@ export async function runPull(
 
   await writeCloneState(targetDir, {
     account: state.account,
-    syncToken,
+    // Held back: the next pull walks from the old token and is delivered the
+    // notes still missing their text again. Everything else in that window
+    // comes again too and is re-applied - harmless, since the remote text is
+    // what this run already wrote and recorded as the base copy, but those
+    // notes show up in that pull's changes a second time.
+    syncToken: heldBack.length > 0 ? state.syncToken : syncToken,
     sharedZoneSyncTokens,
     // Carried through untouched - omitting this here used to silently wipe
     // the vault's replica identity on every pull, forcing the next push to

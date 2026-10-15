@@ -13,6 +13,7 @@ import { composeNoteFile } from "../notes/noteIdFrontmatter.js";
 import { applyNoteFileTimes, modificationDateOf } from "../notes/noteTimestamps.js";
 import { AlreadyClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import type { SyncNotice, SyncProgress } from "../progress.js";
+import { backfillNewPrivateNoteBodies } from "./privateNoteBodies.js";
 
 const PRIVATE_NOTES_ZONE = { zoneName: "Notes" };
 
@@ -102,6 +103,7 @@ export async function runClone(
     {},
     onPage,
   );
+  const heldBack = await backfillNewPrivateNoteBodies(auth.session, auth.ckdatabasewsUrl, auth.dsid, records, {});
 
   const summary: CloneSummary = {
     written: 0,
@@ -122,6 +124,14 @@ export async function runClone(
           : `Skipped the shared zone owned by ${skipped.zoneID.ownerRecordName ?? "unknown"}: ` +
             `${skipped.missingRecordNames.length} note(s) came through without their text and looking them up didn't ` +
             "fill it in - no notes from it were cloned; the first pull will retry it",
+    });
+  }
+  if (heldBack.length > 0) {
+    summary.notices.push({
+      level: "warn",
+      message:
+        `${heldBack.length} note(s) came through without their text, even when looked up - they weren't cloned; ` +
+        "the first pull will look for them again",
     });
   }
   const notes: CloneState["notes"] = {};
@@ -245,7 +255,10 @@ export async function runClone(
   await writeCloneState(targetDir, {
     account: { appleId: auth.appleId, dsid: auth.dsid },
     titleMode,
-    syncToken,
+    // No token while notes are held back: the first pull then walks the zone
+    // from scratch and is delivered them again (along with every other note,
+    // re-applied unchanged).
+    syncToken: heldBack.length > 0 ? undefined : syncToken,
     sharedZoneSyncTokens,
     notes,
     folders: layout.stateFolders,
