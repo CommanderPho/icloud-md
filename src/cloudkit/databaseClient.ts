@@ -259,8 +259,10 @@ export async function fetchZoneNoteRecords(
       const pageRecords = zone.records ?? [];
 
       records.push(...pageRecords);
-      assertPageAdvances(`${database} changes/zone`, zone, syncToken);
-      syncToken = zone.syncToken ?? syncToken;
+      assertPageAdvances(`${database} changes/zone`, zone, syncToken, { startedFromStoredToken: Boolean(startToken) });
+      // `||`, not `??`: an empty token is no token (see `assertPageAdvances`),
+      // and saving one would make the next pull silently walk from scratch.
+      syncToken = zone.syncToken || syncToken;
       moreComing = zone.moreComing === true;
       onPage?.(pageRecords.length);
     }
@@ -321,8 +323,8 @@ export async function fetchAllZoneRecords(
     );
     const zone = firstZone(body);
     records.push(...(zone.records ?? []));
-    assertPageAdvances("private changes/zone", zone, syncToken);
-    syncToken = zone.syncToken ?? syncToken;
+    assertPageAdvances("private changes/zone", zone, syncToken, { startedFromStoredToken: false });
+    syncToken = zone.syncToken || syncToken;
     moreComing = zone.moreComing === true;
     onPage?.((zone.records ?? []).length);
   }
@@ -379,8 +381,8 @@ export async function fetchSharedZoneIds(
     zoneIds.push(...page.zoneIds);
     // The web client treats this as fatal too ("Critical CK Error: Server
     // returned the same sync token").
-    assertPageAdvances("shared changes/database", page, syncToken);
-    syncToken = page.syncToken ?? syncToken;
+    assertPageAdvances("shared changes/database", page, syncToken, { startedFromStoredToken: false });
+    syncToken = page.syncToken || syncToken;
     moreComing = page.moreComing;
   }
 
@@ -474,7 +476,7 @@ export async function lookupRecords(
 }
 
 /** A shared zone whose fetch didn't complete this run, skipped rather than
- * fatal; see `fetchSharedNoteRecords`. Two distinct shapes:
+ * fatal; see `fetchSharedNoteRecords`. Three distinct shapes:
  *
  * - `"zone-not-found"`: `changes/zone` answered ZONE_NOT_FOUND for a zone the
  *   `changes/database` listing advertised - a share revoked or deleted out
@@ -973,9 +975,10 @@ function assertPageAdvances(
   label: string,
   page: { moreComing?: boolean | undefined; syncToken?: string | undefined },
   requestToken: string | undefined,
+  options: { startedFromStoredToken: boolean },
 ): void {
   if (page.moreComing === true && (!page.syncToken || page.syncToken === requestToken)) {
-    throw new CloudKitSyncTokenStalledError(label);
+    throw new CloudKitSyncTokenStalledError(label, options);
   }
 }
 

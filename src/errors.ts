@@ -356,14 +356,22 @@ export class CloudKitZoneFetchFailedError extends CloudKitRequestFailedError {
  * stored token changes when this throws, so every retry fails identically.
  * Never observed on a real account - the guard exists so a server in that
  * state can't spin a pull forever.
+ *
+ * Re-cloning is only offered when the walk began from a stored token: a
+ * fresh clone starts without one, which can only help if that token is
+ * what's stuck. A walk that already started from scratch (`clone`, the
+ * `changes/database` listing) would stall the same way in a new folder.
  */
 export class CloudKitSyncTokenStalledError extends CloudKitRequestFailedError {
-  constructor(label: string) {
+  constructor(label: string, options: { startedFromStoredToken: boolean }) {
+    const reclone = options.startedFromStoredToken
+      ? " This walk started from the folder's stored sync token; cloning into a new folder starts over without " +
+        "it, which may get past it."
+      : "";
     super(`${label} reported moreComing without a new syncToken; refusing to re-request the same page`, {
       hint:
         "iCloud keeps handing back the same page of changes, so retrying sends the same request and fails the " +
-        "same way. Please open a GitHub issue including this message. If it's a pull that keeps failing, cloning " +
-        "into a new folder starts over without the stored sync token, which may get past it.",
+        `same way. Please open a GitHub issue including this message.${reclone}`,
     });
   }
 }

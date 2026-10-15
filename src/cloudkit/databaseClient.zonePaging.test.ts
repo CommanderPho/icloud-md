@@ -94,11 +94,42 @@ function isStalledPageError(error: unknown): boolean {
   return error instanceof CloudKitSyncTokenStalledError && /moreComing without a new syncToken/.test(error.message);
 }
 
+function stalledHint(error: unknown): string {
+  assert.ok(error instanceof CloudKitSyncTokenStalledError);
+  return error.hint ?? "";
+}
+
 test("the stalled-page error says retrying won't help, not the generic wait-and-retry hint", () => {
-  const error = new CloudKitSyncTokenStalledError("private changes/zone");
+  const error = new CloudKitSyncTokenStalledError("private changes/zone", { startedFromStoredToken: false });
   assert.ok(error instanceof CloudKitRequestFailedError);
   assert.match(error.hint ?? "", /retrying sends the same request/);
   assert.doesNotMatch(error.hint ?? "", /wait a moment/);
+});
+
+test("a stall in a walk from the stored token suggests re-cloning", async () => {
+  const { restore } = installFetchMock([zonePage(true, "stored", "note-1")]);
+  try {
+    const error = await fetchAllNoteRecords(session, host, "12345", "stored").then(
+      () => assert.fail("expected the stalled page to throw"),
+      (caught: unknown) => caught,
+    );
+    assert.match(stalledHint(error), /cloning into a new folder/);
+  } finally {
+    restore();
+  }
+});
+
+test("a stall in a walk that started from scratch doesn't suggest re-cloning - a new folder would stall the same way", async () => {
+  const { restore } = installFetchMock([zonePage(true, "page-1", "note-1"), zonePage(true, "page-1", "note-1")]);
+  try {
+    const error = await fetchAllNoteRecords(session, host, "12345").then(
+      () => assert.fail("expected the stalled page to throw"),
+      (caught: unknown) => caught,
+    );
+    assert.doesNotMatch(stalledHint(error), /clon/);
+  } finally {
+    restore();
+  }
 });
 
 test("an incremental walk fails loudly when a moreComing page hands back the token it was sent", async () => {
@@ -192,6 +223,17 @@ test("an empty-string token on a moreComing page counts as no token - it must no
   try {
     await assert.rejects(fetchAllNoteRecords(session, host, "12345", "stored"), isStalledPageError);
     assert.equal(zoneRequests.length, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("an empty-string token on the last page keeps the previous token instead of saving an empty one", async () => {
+  const { restore } = installFetchMock([zonePage(true, "page-1", "note-1"), zonePage(false, "", "note-2")]);
+  try {
+    const result = await fetchAllNoteRecords(session, host, "12345", "stored");
+    assert.equal(result.records.length, 2);
+    assert.equal(result.syncToken, "page-1");
   } finally {
     restore();
   }

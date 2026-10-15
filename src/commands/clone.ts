@@ -265,7 +265,8 @@ function skippedZoneNotice(skipped: SkippedSharedZone): string {
     case "stalled-sync-token":
       return (
         `Skipped the shared zone owned by ${owner}: iCloud kept handing back the same page of changes for it - no ` +
-        "notes from it were cloned; the first pull will retry it"
+        "notes from it were cloned. Pulls will try it again, but each sends the same request, so if this keeps " +
+        "happening, please open a GitHub issue including this message"
       );
   }
 }
