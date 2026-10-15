@@ -1,13 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { readBaseCopy, writeBaseCopy } from "../notes/baseCopy.js";
+import { splitFrontmatter } from "../notes/frontmatter.js";
+import { readNoteId, readNoteTitle } from "../notes/noteIdFrontmatter.js";
+import { titleFromNoteFileName } from "../notes/noteTitleParagraph.js";
 import { writeCloneState, type CloneState } from "../notes/cloneState.js";
-import { indexUntrackedNoteIds } from "../notes/untrackedFiles.js";
-import { followLocalMove } from "./pull.js";
-import { buildPushPlan } from "./push.js";
+import { forgetIndexedFile, indexUntrackedNoteIds } from "../notes/untrackedFiles.js";
+import { followLocalMove, type MovedFileTitles } from "./pull.js";
+import { buildPushPlan, titleExpressedByFile } from "./push.js";
 
 /**
  * Pull's half of a note moved or renamed by hand and not yet pushed: when
@@ -55,9 +58,13 @@ function trackedNotes(): CloneState["notes"] {
 }
 
 /** Index the vault exactly as pull does, then follow the missing note. */
-async function follow(dir: string, remoteBody: string): ReturnType<typeof followLocalMove> {
+async function follow(
+  dir: string,
+  remoteBody: string,
+  titles: MovedFileTitles = { previousTitle: undefined, remoteTitle: undefined },
+): ReturnType<typeof followLocalMove> {
   const index = await indexUntrackedNoteIds(dir, trackedNotes());
-  return followLocalMove(dir, NOTE_ID, TRACKED, index, remoteBody);
+  return followLocalMove(dir, NOTE_ID, index, remoteBody, titles);
 }
 
 test("a note renamed in place takes the remote change at its new name", () =>
@@ -121,6 +128,75 @@ test("the moved file's own envelope is left as the user has it, title key includ
     );
   }));
 
+test("a title key that only repeats the last synced title follows a remote retitle", () =>
+  withTempDir(async (dir) => {
+    // "a/b" can't be a file name, so the note sat at Untitled.md with the key.
+    // Moved to Recipes/ and retitled "Pie" on the phone, the key would
+    // otherwise outrank the name in push and send "a/b" back.
+    await writeBaseCopy(dir, NOTE_ID, "Synced text");
+    await writeVaultFile(dir, "Recipes/Untitled.md", withId("Synced text", 'apple-note-title: "a/b"\n'));
+
+    await follow(dir, "Synced text", { previousTitle: "a/b", remoteTitle: undefined, titleMode: "filename" });
+
+    const { frontmatter } = splitFrontmatter(await readFile(path.join(dir, "Recipes/Untitled.md"), "utf-8"), {
+      filenameAsTitle: true,
+    });
+    assert.equal(readNoteTitle(frontmatter), undefined);
+    assert.equal(readNoteId(frontmatter), NOTE_ID);
+  }));
+
+test("a stale title key is moved to a remote title that still needs one", () =>
+  withTempDir(async (dir) => {
+    await writeBaseCopy(dir, NOTE_ID, "Synced text");
+    await writeVaultFile(dir, "Recipes/Untitled.md", withId("Synced text", 'apple-note-title: "a/b"\n'));
+
+    await follow(dir, "Synced text", { previousTitle: "a/b", remoteTitle: "c/d", titleMode: "filename" });
+
+    const { frontmatter } = splitFrontmatter(await readFile(path.join(dir, "Recipes/Untitled.md"), "utf-8"), {
+      filenameAsTitle: true,
+    });
+    assert.equal(readNoteTitle(frontmatter), "c/d");
+  }));
+
+test("a title key the user changed, or none at all, is left as it is", () =>
+  withTempDir(async (dir) => {
+    // A key that no longer matches the last synced title is the user's
+    // retitle. A missing key is never added: the file's name is then the
+    // title the user gave it, and a key would outrank a rename of theirs.
+    await writeBaseCopy(dir, NOTE_ID, "Synced text");
+    await writeVaultFile(dir, "Recipes/Untitled.md", withId("Synced text", 'apple-note-title: "Mine"\n'));
+    await follow(dir, "Synced text", { previousTitle: "a/b", remoteTitle: "c/d", titleMode: "filename" });
+    assert.equal(
+      await readFile(path.join(dir, "Recipes/Untitled.md"), "utf-8"),
+      withId("Synced text", 'apple-note-title: "Mine"\n'),
+    );
+
+    await rm(path.join(dir, "Recipes/Untitled.md"));
+    await writeVaultFile(dir, "Recipes/Cake.md", withId("Synced text"));
+    await follow(dir, "Synced text", { previousTitle: undefined, remoteTitle: "c/d", titleMode: "filename" });
+    assert.equal(await readFile(path.join(dir, "Recipes/Cake.md"), "utf-8"), withId("Synced text"));
+  }));
+
+test("push reads no retitle from a followed folder-only move while the tracked path keeps the old name", () =>
+  withTempDir(async (dir) => {
+    // The contract runPull relies on when it leaves the tracked path where
+    // the note was (Notes/Pie.md) rather than renamed for a remote retitle
+    // to "Tart": push takes the previous title from the tracked path, so a
+    // renamed one would read "Tart" -> "Pie" as the user retitling it back.
+    // runPull itself has no unit harness; this pins push's half.
+    await writeBaseCopy(dir, NOTE_ID, "Synced text");
+    await writeVaultFile(dir, "Recipes/Pie.md", withId("Synced text"));
+
+    await follow(dir, "Synced text", { previousTitle: undefined, remoteTitle: undefined, titleMode: "filename" });
+
+    const { frontmatter } = splitFrontmatter(await readFile(path.join(dir, "Recipes/Pie.md"), "utf-8"), {
+      filenameAsTitle: true,
+    });
+    const fileTitle = readNoteTitle(frontmatter);
+    const recordedTitles = new Map(fileTitle === undefined ? [] : [["Recipes/Pie.md", fileTitle]]);
+    assert.equal(titleExpressedByFile("Recipes/Pie.md", recordedTitles), titleFromNoteFileName("Notes/Pie.md"));
+  }));
+
 test("a note that's simply gone is recreated at its tracked path, as before", () =>
   withTempDir(async (dir) => {
     await writeBaseCopy(dir, NOTE_ID, "Synced text");
@@ -139,8 +215,7 @@ test("two files claiming the note are left alone - the note is recreated, with a
     const outcome = await follow(dir, "Edited on the phone");
 
     assert.equal(outcome.kind, "recreate");
-    assert.equal(outcome.kind === "recreate" ? outcome.notice?.level : undefined, "warn");
-    assert.match(outcome.kind === "recreate" ? (outcome.notice?.message ?? "") : "", /Recipes\/Pie copy\.md, Recipes\/Pie\.md/);
+    assert.match(outcome.kind === "recreate" ? (outcome.warning ?? "") : "", /Recipes\/Pie copy\.md, Recipes\/Pie\.md/);
     assert.equal(await readFile(path.join(dir, "Recipes/Pie.md"), "utf-8"), withId("Synced text"));
     assert.equal(await readFile(path.join(dir, "Recipes/Pie copy.md"), "utf-8"), withId("Synced text"));
     assert.equal(await readBaseCopy(dir, NOTE_ID), "Synced text");
@@ -155,7 +230,7 @@ test("a moved file still carrying conflict markers isn't merged into - the note 
     const outcome = await follow(dir, "Edited on the phone");
 
     assert.equal(outcome.kind, "recreate");
-    assert.match(outcome.kind === "recreate" ? (outcome.notice?.message ?? "") : "", /conflict markers/);
+    assert.match(outcome.kind === "recreate" ? (outcome.warning ?? "") : "", /conflict markers/);
     assert.equal(await readFile(path.join(dir, "Recipes/Moved.md"), "utf-8"), marked);
     assert.equal(await readBaseCopy(dir, NOTE_ID), "Synced text");
   }));
@@ -196,3 +271,25 @@ test("the id index skips tracked files, id-less files, attachments, and dot-dire
 
     assert.deepEqual([...index], [[NOTE_ID, ["Recipes/Moved.md"]]]);
   }));
+
+test("a file the index can't read is skipped rather than failing the pull", { skip: process.getuid?.() === 0 }, () =>
+  withTempDir(async (dir) => {
+    await writeVaultFile(dir, "Recipes/Moved.md", withId("Moved"));
+    await writeVaultFile(dir, "Recipes/Locked.md", withId("Locked"));
+    await chmod(path.join(dir, "Recipes/Locked.md"), 0o000);
+
+    const index = await indexUntrackedNoteIds(dir, trackedNotes());
+
+    assert.deepEqual([...index], [[NOTE_ID, ["Recipes/Moved.md"]]]);
+  }));
+
+test("a file pull writes a new note over drops out of the index", () => {
+  const index = new Map([
+    [NOTE_ID, ["Recipes/Moved.md", "Recipes/Pie.md"]],
+    ["OTHER", ["Recipes/Pie.md"]],
+  ]);
+
+  forgetIndexedFile(index, "Recipes/Pie.md");
+
+  assert.deepEqual([...index], [[NOTE_ID, ["Recipes/Moved.md"]]]);
+});

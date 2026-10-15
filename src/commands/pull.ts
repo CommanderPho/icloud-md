@@ -29,8 +29,15 @@ import { localFileState } from "../notes/localFileState.js";
 import { writeCloneState, type CloneState, type CloneStateNoteEntry, type TitleMode } from "../notes/cloneState.js";
 import { migrationReporter, openVault } from "../notes/vaultMigrations.js";
 import { pendingRenameTarget, settlePendingRenames } from "../notes/pendingRename.js";
-import { composeNoteFile, NOTE_ID_KEY, NOTE_TITLE_KEY } from "../notes/noteIdFrontmatter.js";
-import { indexUntrackedNoteIds } from "../notes/untrackedFiles.js";
+import {
+  clearNoteTitle,
+  composeNoteFile,
+  NOTE_ID_KEY,
+  NOTE_TITLE_KEY,
+  readNoteTitle,
+  setNoteTitle,
+} from "../notes/noteIdFrontmatter.js";
+import { forgetIndexedFile, indexUntrackedNoteIds } from "../notes/untrackedFiles.js";
 import { recordEpoch } from "../notes/noteEpoch.js";
 import { applyNoteFileTimes, modificationDateOf } from "../notes/noteTimestamps.js";
 import { recordVersion } from "../notes/versionHistory.js";
@@ -437,6 +444,11 @@ export async function runPull(
           );
           await applyNoteFileTimes(filePath, record);
           await writeBaseCopy(targetDir, record.recordName, bodyText);
+          // The name is only unique among tracked files, so this may have
+          // just written over an untracked one the moved-file index holds.
+          if (movedFileIndex !== undefined) {
+            forgetIndexedFile(movedFileIndex, relativeFile);
+          }
           notes[record.recordName] = {
             file: relativeFile,
             recordChangeTag: record.recordChangeTag ?? "",
@@ -457,60 +469,48 @@ export async function runPull(
 
         const local = await localFileState(targetDir, existing, record.recordName, titleMode);
 
-        // A remote retitle has to rename the file, because in this vault the
-        // file name is the only place the title lives. Leaving it stale
-        // isn't cosmetic: push reads a *renamed* file's name as the user's
-        // new title, so a name that silently disagrees with the note is a
-        // retitle waiting to be reverted by whoever next touches the file.
-        // Deliberately after `localFileState`, which reads the old path.
-        const { file, pendingRename } = await renameForRemoteTitle(targetDir, existing.file, decoded.titleLine, titleMode, {
-          usedFileNames,
-          onDisk: local !== "missing",
-          defer: deferRenames,
+        // What every branch that brings the remote change in records: its
+        // tag, date, placement and title, at the tracked path given.
+        const advancedEntry = (trackedFile: string, pendingRename: string | undefined): CloneStateNoteEntry => ({
+          ...existing,
+          file: trackedFile,
+          recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
+          modificationDate: modificationDateOf(record),
+          unpublishableReason,
+          folderRecordName: placement.folderRecordName,
+          frontmatterTitle: recordedTitle,
+          pendingRename,
         });
-        const previousFile = file === existing.file ? undefined : { previousFile: existing.file };
-        // Every branch below rewrites this note's entry, so `pendingRename`
-        // is set unconditionally rather than carried through `...existing`:
-        // undefined is the answer that *clears* a rename that has since been
-        // performed or overtaken by a newer title.
-        const renameFields = { pendingRename };
-        const deferred =
-          pendingRename === undefined ? {} : { pendingRename: path.posix.join(noteDirOf(file), pendingRename) };
-        const deferredRemarks: PullChangeRemark[] =
-          pendingRename === undefined
-            ? []
-            : [{ tone: "note", message: `rename deferred: this file should become "${pendingRename}"` }];
-        const infoRemarks: PullChangeRemark[] = [...titleRemarks, ...deferredRemarks];
 
         // A missing file may only have been moved or renamed by hand, not
         // deleted - and recreating it at the old path is then the worst thing
         // to do: the original reappears beside the moved file, push reads the
         // moved file as a copy, and the user's edits go up as a duplicate
         // note. The moved file carries the note's id, so follow it there.
-        let recreateNotice: PullNotice = { level: "info", message: `Recreated ${file} (was missing locally)` };
+        // Ahead of the remote-retitle rename below, which is for a file pull
+        // is about to write at its tracked path - and this one it isn't.
+        let recreateWarning: string | undefined;
         if (local === "missing") {
           movedFileIndex ??= await indexUntrackedNoteIds(targetDir, notes, titleMode);
-          const followed = await followLocalMove(targetDir, record.recordName, file, movedFileIndex, bodyText, titleMode);
+          const followed = await followLocalMove(targetDir, record.recordName, movedFileIndex, bodyText, {
+            previousTitle: existing.frontmatterTitle,
+            remoteTitle: recordedTitle,
+            titleMode,
+          });
           if (followed.kind === "recreate") {
-            recreateNotice = followed.notice ?? recreateNotice;
+            recreateWarning = followed.warning;
           } else {
             if (followed.status === "updated") {
               await applyNoteFileTimes(path.join(targetDir, followed.file), record);
             }
-            // The tracked path deliberately stays where the note was: the
-            // move is the user's and hasn't been pushed yet, and push only
-            // sees it as a move while the tracked file is missing and the
-            // moved one untracked.
-            notes[record.recordName] = {
-              ...existing,
-              file,
-              recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
-              modificationDate: modificationDateOf(record),
-              unpublishableReason,
-              folderRecordName: placement.folderRecordName,
-              frontmatterTitle: recordedTitle,
-              ...renameFields,
-            };
+            // The tracked path stays exactly where the note was - not even
+            // renamed for a remote retitle. The move is the user's and hasn't
+            // been pushed yet: push only sees it as a move while the tracked
+            // file is missing and the moved one untracked, and takes the
+            // note's previous title from the tracked path, so a retitled path
+            // here would read as the user retitling it back. A remote retitle
+            // reaches the file's name on the pull after the move is pushed.
+            notes[record.recordName] = advancedEntry(existing.file, undefined);
             const movedRemark: PullChangeRemark = {
               tone: "note",
               message: `moved here locally from ${existing.file} - "push" sends the move`,
@@ -539,6 +539,31 @@ export async function runPull(
           }
         }
 
+        // A remote retitle has to rename the file, because in this vault the
+        // file name is the only place the title lives. Leaving it stale
+        // isn't cosmetic: push reads a *renamed* file's name as the user's
+        // new title, so a name that silently disagrees with the note is a
+        // retitle waiting to be reverted by whoever next touches the file.
+        // Deliberately after `localFileState`, which reads the old path.
+        const { file, pendingRename } = await renameForRemoteTitle(targetDir, existing.file, decoded.titleLine, titleMode, {
+          usedFileNames,
+          onDisk: local !== "missing",
+          defer: deferRenames,
+        });
+        const previousFile = file === existing.file ? undefined : { previousFile: existing.file };
+        // Every branch below rewrites this note's entry, so `pendingRename`
+        // is set unconditionally rather than carried through `...existing`:
+        // undefined is the answer that *clears* a rename that has since been
+        // performed or overtaken by a newer title.
+        const renameFields = { pendingRename };
+        const deferred =
+          pendingRename === undefined ? {} : { pendingRename: path.posix.join(noteDirOf(file), pendingRename) };
+        const deferredRemarks: PullChangeRemark[] =
+          pendingRename === undefined
+            ? []
+            : [{ tone: "note", message: `rename deferred: this file should become "${pendingRename}"` }];
+        const infoRemarks: PullChangeRemark[] = [...titleRemarks, ...deferredRemarks];
+
         if (local === "clean" || local === "missing") {
           const filePath = path.join(targetDir, file);
           // Preserve any local-only frontmatter on a clean file (a missing
@@ -558,18 +583,13 @@ export async function runPull(
           await applyNoteFileTimes(filePath, record);
           await writeBaseCopy(targetDir, record.recordName, bodyText);
           if (local === "missing") {
-            summary.notices.push(recreateNotice);
+            summary.notices.push(
+              recreateWarning === undefined
+                ? { level: "info", message: `Recreated ${file} (was missing locally)` }
+                : { level: "warn", message: `Recreated ${file}: ${recreateWarning}` },
+            );
           }
-          notes[record.recordName] = {
-            ...existing,
-            file,
-            recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
-            modificationDate: modificationDateOf(record),
-            unpublishableReason,
-            folderRecordName: placement.folderRecordName,
-            frontmatterTitle: recordedTitle,
-            ...renameFields,
-          };
+          notes[record.recordName] = advancedEntry(file, pendingRename);
           summary.updated += 1;
           summary.changes.push({
             kind: "update",
@@ -614,16 +634,7 @@ export async function runPull(
           });
           continue;
         }
-        notes[record.recordName] = {
-          ...existing,
-          file,
-          recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
-          modificationDate: modificationDateOf(record),
-          unpublishableReason,
-          folderRecordName: placement.folderRecordName,
-          frontmatterTitle: recordedTitle,
-          ...renameFields,
-        };
+        notes[record.recordName] = advancedEntry(file, pendingRename);
 
         if (merged.status === "conflict") {
           summary.conflicts.push(`${file}: merged with conflict markers - resolve manually`);
@@ -1082,11 +1093,21 @@ export async function mergeRemoteChangeIntoLocalFile(
 }
 
 /** What pull does about a tracked note whose file is missing: follow it to
- * the file it was moved to, or (`notice` saying why, when it isn't simply
- * gone) recreate it at its tracked path. */
+ * the file it was moved to, or recreate it at its tracked path (with a
+ * `warning` saying why, when it isn't simply gone). */
 export type LocalMoveOutcome =
   | { kind: "followed"; file: string; status: "updated" | "merged" | "conflict" }
-  | { kind: "recreate"; notice?: PullNotice | undefined };
+  | { kind: "recreate"; warning?: string | undefined };
+
+/** The note's `apple-note-title` as the last sync recorded it and as the
+ * remote change now has it (undefined: the name carries the title), so a
+ * key in the moved file that merely repeats the old one can be kept in
+ * step - see `mergeRemoteChangeIntoMovedFile`. */
+export interface MovedFileTitles {
+  previousTitle: string | undefined;
+  remoteTitle: string | undefined;
+  titleMode?: TitleMode | undefined;
+}
 
 /**
  * Follows a tracked note whose file is missing to wherever it was moved or
@@ -1098,44 +1119,43 @@ export type LocalMoveOutcome =
  * the same case for the same reason); a claimant still carrying conflict
  * markers can't take a merge. Both fall back to recreating the note at its
  * tracked path, as before this existed - the claimants are left untouched,
- * and the notice says what push will make of them.
+ * and the warning says what push will make of them.
+ *
+ * Recreating is not the only way out of those two, but it's the one that
+ * can't strand anything. Leaving the note missing and its tag where it was
+ * (as an in-place file with markers does) would leave the move unpushable -
+ * push refuses a move whose tag is stale, and an incremental pull never
+ * delivers this change again - with nothing the user could do about it
+ * short of a fresh clone. A duplicate the warning names is the lesser harm.
  */
 export async function followLocalMove(
   targetDir: string,
   recordName: string,
-  trackedFile: string,
   untrackedIds: ReadonlyMap<string, readonly string[]>,
   remoteBodyText: string,
-  titleMode: TitleMode = "in-body",
+  titles: MovedFileTitles,
 ): Promise<LocalMoveOutcome> {
   const claimants = untrackedIds.get(recordName) ?? [];
   if (claimants.length > 1) {
     return {
       kind: "recreate",
-      notice: {
-        level: "warn",
-        message:
-          `Recreated ${trackedFile}: ${claimants.length} files carry its ${NOTE_ID_KEY} (${claimants.join(", ")}), ` +
-          "so which one it was moved to can't be told - delete the copies you don't want before pushing, or they " +
-          "go up as new notes",
-      },
+      warning:
+        `${claimants.length} files carry its ${NOTE_ID_KEY} (${claimants.join(", ")}), so which one it was ` +
+        "moved to can't be told - delete the copies you don't want before pushing, or they go up as new notes",
     };
   }
   const movedFile = claimants[0];
   if (movedFile === undefined) {
     return { kind: "recreate" };
   }
-  const merged = await mergeRemoteChangeIntoMovedFile(targetDir, recordName, movedFile, remoteBodyText, titleMode);
+  const merged = await mergeRemoteChangeIntoMovedFile(targetDir, recordName, movedFile, remoteBodyText, titles);
   if (merged.status === "unresolvedMarkers") {
     return {
       kind: "recreate",
-      notice: {
-        level: "warn",
-        message:
-          `Recreated ${trackedFile}: it was moved locally to ${movedFile}, which still contains diff3 conflict ` +
-          "markers, so the remote change couldn't be merged there - resolve the markers, then delete one of the " +
-          "two copies before pushing, or the other goes up as a new note",
-      },
+      warning:
+        `it was moved locally to ${movedFile}, which still contains diff3 conflict markers, so the remote change ` +
+        "couldn't be merged there - resolve the markers, then delete one of the two copies before pushing, or the " +
+        "other goes up as a new note",
     };
   }
   return { kind: "followed", file: movedFile, status: merged.status };
@@ -1148,23 +1168,37 @@ export async function followLocalMove(
  * The same base-copy discipline as `mergeRemoteChangeIntoLocalFile`: an
  * unedited file just takes the remote text, an edited one gets a 3-way
  * merge, and the base copy only advances to the remote text when nothing is
- * left to resolve. What differs is the envelope, which is left exactly as
- * the user has it - including any `apple-note-title`. The local move wins,
- * and under filename-as-title a renamed file *is* a retitle, which push
- * sends from the file's name and envelope; restamping the remote's title
- * key here would quietly undo it.
+ * left to resolve.
+ *
+ * What differs is the envelope, which stays as the user has it - with one
+ * exception. The local move wins, and under filename-as-title a renamed
+ * file *is* a retitle that push sends from the file's name and envelope, so
+ * an `apple-note-title` the user set or changed is left alone. But a key
+ * that still says exactly what the last sync recorded is only the old
+ * remote title, not a choice of theirs, and push reads it ahead of the name.
+ * Left stale, it would send the note's previous title back over the remote
+ * retitle. That key follows the remote title instead,
+ * as it would have in a file that never moved.
  */
 export async function mergeRemoteChangeIntoMovedFile(
   targetDir: string,
   recordName: string,
   movedFile: string,
   remoteBodyText: string,
-  titleMode: TitleMode = "in-body",
+  { previousTitle, remoteTitle, titleMode = "in-body" }: MovedFileTitles,
 ): Promise<{ status: "updated" | "merged" | "conflict" | "unresolvedMarkers" }> {
   const filePath = path.join(targetDir, movedFile);
-  const { frontmatter, body } = splitFrontmatter(await readFile(filePath, "utf-8"), {
+  const split = splitFrontmatter(await readFile(filePath, "utf-8"), {
     filenameAsTitle: titleMode === "filename",
   });
+  const { body } = split;
+  const fileTitle = readNoteTitle(split.frontmatter);
+  const frontmatter =
+    fileTitle === undefined || fileTitle !== previousTitle || fileTitle === remoteTitle
+      ? split.frontmatter
+      : remoteTitle === undefined
+        ? clearNoteTitle(split.frontmatter)
+        : setNoteTitle(split.frontmatter, remoteTitle);
   const base = await readBaseCopy(targetDir, recordName);
   if (base !== undefined && body === base) {
     await writeFile(filePath, joinFrontmatter(frontmatter, remoteBodyText), "utf-8");

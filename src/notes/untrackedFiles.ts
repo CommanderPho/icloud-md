@@ -4,6 +4,7 @@ import { isEnoent } from "../fsUtil.js";
 import type { CloneState, TitleMode } from "./cloneState.js";
 import { splitFrontmatter } from "./frontmatter.js";
 import { readNoteId } from "./noteIdFrontmatter.js";
+import { groupNoteIdClaims, type UntrackedFile } from "./noteIdPairing.js";
 
 /** Untracked `.md` files anywhere in the vault, as vault-root-relative
  * POSIX paths - the raw material for push's create half, the local-move
@@ -49,25 +50,49 @@ export async function listUntrackedMarkdownFiles(targetDir: string, notes: Clone
  * file is can only be guessed, and pull doesn't guess (push's content and
  * basename fallbacks are for planning a move the user then confirms by
  * pushing, not for deciding where remote text gets written).
+ *
+ * A file that can't be read (gone since the directory was listed, or not
+ * readable) is left out rather than failing the pull: it can't be the
+ * target of a merge either way, and before this index existed a missing
+ * note never read unrelated files at all.
  */
 export async function indexUntrackedNoteIds(
   targetDir: string,
   notes: CloneState["notes"],
   titleMode: TitleMode = "in-body",
 ): Promise<Map<string, string[]>> {
-  const byId = new Map<string, string[]>();
+  const untracked: UntrackedFile[] = [];
   for (const file of await listUntrackedMarkdownFiles(targetDir, notes)) {
-    const raw = await readFile(path.join(targetDir, file), "utf-8");
-    const noteId = readNoteId(splitFrontmatter(raw, { filenameAsTitle: titleMode === "filename" }).frontmatter);
-    if (noteId === undefined) {
-      continue;
+    let raw: string;
+    try {
+      raw = await readFile(path.join(targetDir, file), "utf-8");
+    } catch (cause) {
+      if (isEnoent(cause) || isEacces(cause)) {
+        continue;
+      }
+      throw cause;
     }
-    const files = byId.get(noteId);
-    if (files) {
-      files.push(file);
-    } else {
-      byId.set(noteId, [file]);
+    const noteId = readNoteId(splitFrontmatter(raw, { filenameAsTitle: titleMode === "filename" }).frontmatter);
+    untracked.push({ file, noteId });
+  }
+  return groupNoteIdClaims(untracked);
+}
+
+/** Drops `file` from an index built by `indexUntrackedNoteIds`, once pull
+ * has written a note of its own there: the file is no longer the untracked
+ * copy the index recorded, and following a move into it would merge one
+ * note's text into another's. */
+export function forgetIndexedFile(index: Map<string, string[]>, file: string): void {
+  for (const [noteId, files] of index) {
+    const remaining = files.filter((claimant) => claimant !== file);
+    if (remaining.length === 0) {
+      index.delete(noteId);
+    } else if (remaining.length !== files.length) {
+      index.set(noteId, remaining);
     }
   }
-  return byId;
+}
+
+function isEacces(err: unknown): boolean {
+  return err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "EACCES";
 }
