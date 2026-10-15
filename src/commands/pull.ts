@@ -352,6 +352,35 @@ export async function runPull(
         // later step); a new note is placed by the current folder tree.
         // `folderRecordName` always reflects the *current* membership.
         const placement = placeNote(layout, record, source.sharedZoneOwner);
+
+        // The note this vault already holds at exactly this version - most
+        // often one the `push` just before this pull wrote, which the
+        // incremental fetch hands straight back. Rewriting it would reset the
+        // file's mtime and report an "update" nobody made. The snapshot above
+        // still runs: push doesn't record the text it uploaded, so this is
+        // where that version enters the history.
+        if (
+          existing !== undefined &&
+          (await isAlreadyAtTrackedVersion(
+            targetDir,
+            record,
+            existing,
+            {
+              titleLine: decoded.titleLine,
+              folderRecordName: placement.folderRecordName,
+              frontmatterTitle: recordedTitle,
+              unpublishableReason: decoded.unpublishableReason,
+            },
+            titleMode,
+            tableAttachments,
+          ))
+        ) {
+          if (recordedNewSnapshot) {
+            await recordEpoch(targetDir, record.recordName, [record.recordName]);
+          }
+          continue;
+        }
+
         const noteDir = existing ? noteDirOf(existing.file) : placement.dir;
 
         let bodyText = decoded.markdownText;
@@ -702,6 +731,58 @@ async function backfillSharePermissions(
         : [];
     zone.records.push(...folderRecords, ...shareRecords);
   }
+}
+
+/** What a pull derives from a delivered record, beyond its change tag, that
+ * ends up in the note's tracked entry or its file name. */
+export interface DerivedNoteFields {
+  titleLine: string;
+  folderRecordName: string | undefined;
+  frontmatterTitle: string | undefined;
+  unpublishableReason: string | undefined;
+}
+
+/**
+ * Whether applying a delivered record would only rewrite what this vault
+ * already holds: its change tag is the one tracked, and nothing else a pull
+ * would derive from it differs from the tracked entry.
+ *
+ * The tag alone isn't enough. `push` - and `status`, which plans a push -
+ * can adopt a remote change by merging its text and advancing the tag,
+ * without ever updating the folder, the title, or the read-only flag that
+ * came with it. Until now the re-delivery of that record is what caught
+ * those up, so a record whose derived fields disagree with the entry goes
+ * through the normal path. So does one whose file is missing (pull
+ * recreates it), one with a rename still pending, and one with tables: their
+ * snapshots are taken while resolving the attachments, and `push` doesn't
+ * record the table bytes it uploads either.
+ */
+export async function isAlreadyAtTrackedVersion(
+  targetDir: string,
+  record: CloudKitRecord,
+  existing: CloneStateNoteEntry,
+  derived: DerivedNoteFields,
+  titleMode: TitleMode,
+  tableAttachments: NonNullable<CloneState["tableAttachments"]>,
+): Promise<boolean> {
+  if (record.recordChangeTag === undefined || record.recordChangeTag !== existing.recordChangeTag) {
+    return false;
+  }
+  if (
+    derived.folderRecordName !== existing.folderRecordName ||
+    derived.frontmatterTitle !== existing.frontmatterTitle ||
+    derived.unpublishableReason !== existing.unpublishableReason ||
+    existing.pendingRename !== undefined
+  ) {
+    return false;
+  }
+  if (titleMode === "filename" && !fileNameCarriesTitle(path.posix.basename(existing.file), derived.titleLine)) {
+    return false;
+  }
+  if (Object.values(tableAttachments).some((entry) => entry.noteRecordName === record.recordName)) {
+    return false;
+  }
+  return (await localFileState(targetDir, existing, record.recordName, titleMode)) !== "missing";
 }
 
 /**
