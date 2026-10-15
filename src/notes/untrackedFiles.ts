@@ -1,6 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import { isEnoent } from "../fsUtil.js";
+import { hasErrnoCode, isEnoent } from "../fsUtil.js";
 import type { CloneState, TitleMode } from "./cloneState.js";
 import { splitFrontmatter } from "./frontmatter.js";
 import { readNoteId } from "./noteIdFrontmatter.js";
@@ -44,6 +44,15 @@ export async function listUntrackedMarkdownFiles(targetDir: string, notes: Clone
   return found.sort();
 }
 
+/** Untracked files by the `apple-note-id` they carry, plus the ones that
+ * couldn't be read to find out. */
+export interface UntrackedNoteIdIndex {
+  claims: Map<string, string[]>;
+  /** Files that exist but weren't readable - any one of them may be a moved
+   * note, which is worth saying when a note then can't be followed. */
+  unreadable: string[];
+}
+
 /**
  * Every untracked file that carries an `apple-note-id`, grouped by that id.
  * A file with no usable id isn't in it at all: without one, which note a
@@ -54,20 +63,26 @@ export async function listUntrackedMarkdownFiles(targetDir: string, notes: Clone
  * A file that can't be read (gone since the directory was listed, or not
  * readable) is left out rather than failing the pull: it can't be the
  * target of a merge either way, and before this index existed a missing
- * note never read unrelated files at all.
+ * note never read unrelated files at all. An unreadable one is listed in
+ * `unreadable`, so the recreate that follows can say why.
  */
 export async function indexUntrackedNoteIds(
   targetDir: string,
   notes: CloneState["notes"],
   titleMode: TitleMode = "in-body",
-): Promise<Map<string, string[]>> {
+): Promise<UntrackedNoteIdIndex> {
   const untracked: UntrackedFile[] = [];
+  const unreadable: string[] = [];
   for (const file of await listUntrackedMarkdownFiles(targetDir, notes)) {
     let raw: string;
     try {
       raw = await readFile(path.join(targetDir, file), "utf-8");
     } catch (cause) {
-      if (isEnoent(cause) || isEacces(cause)) {
+      if (isEnoent(cause)) {
+        continue;
+      }
+      if (hasErrnoCode(cause, "EACCES")) {
+        unreadable.push(file);
         continue;
       }
       throw cause;
@@ -75,24 +90,21 @@ export async function indexUntrackedNoteIds(
     const noteId = readNoteId(splitFrontmatter(raw, { filenameAsTitle: titleMode === "filename" }).frontmatter);
     untracked.push({ file, noteId });
   }
-  return groupNoteIdClaims(untracked);
+  return { claims: groupNoteIdClaims(untracked), unreadable };
 }
 
 /** Drops `file` from an index built by `indexUntrackedNoteIds`, once pull
  * has written a note of its own there: the file is no longer the untracked
  * copy the index recorded, and following a move into it would merge one
  * note's text into another's. */
-export function forgetIndexedFile(index: Map<string, string[]>, file: string): void {
-  for (const [noteId, files] of index) {
+export function forgetIndexedFile(index: UntrackedNoteIdIndex, file: string): void {
+  for (const [noteId, files] of index.claims) {
     const remaining = files.filter((claimant) => claimant !== file);
     if (remaining.length === 0) {
-      index.delete(noteId);
+      index.claims.delete(noteId);
     } else if (remaining.length !== files.length) {
-      index.set(noteId, remaining);
+      index.claims.set(noteId, remaining);
     }
   }
-}
-
-function isEacces(err: unknown): boolean {
-  return err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "EACCES";
+  index.unreadable = index.unreadable.filter((unreadable) => unreadable !== file);
 }

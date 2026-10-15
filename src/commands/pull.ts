@@ -37,7 +37,7 @@ import {
   readNoteTitle,
   setNoteTitle,
 } from "../notes/noteIdFrontmatter.js";
-import { forgetIndexedFile, indexUntrackedNoteIds } from "../notes/untrackedFiles.js";
+import { forgetIndexedFile, indexUntrackedNoteIds, type UntrackedNoteIdIndex } from "../notes/untrackedFiles.js";
 import { recordEpoch } from "../notes/noteEpoch.js";
 import { applyNoteFileTimes, modificationDateOf } from "../notes/noteTimestamps.js";
 import { recordVersion } from "../notes/versionHistory.js";
@@ -253,7 +253,7 @@ export async function runPull(
 
   // Where hand-moved notes went, by `apple-note-id` - built the first time a
   // tracked file turns up missing, since most pulls never need it.
-  let movedFileIndex: Map<string, string[]> | undefined;
+  let movedFileIndex: UntrackedNoteIdIndex | undefined;
 
   const totalRecords = sources.reduce((sum, source) => sum + source.records.length, 0);
   progress?.onProcessStart?.(totalRecords);
@@ -446,6 +446,8 @@ export async function runPull(
           await writeBaseCopy(targetDir, record.recordName, bodyText);
           // The name is only unique among tracked files, so this may have
           // just written over an untracked one the moved-file index holds.
+          // This only keeps the index honest; the overwrite itself predates
+          // following moves and isn't prevented here.
           if (movedFileIndex !== undefined) {
             forgetIndexedFile(movedFileIndex, relativeFile);
           }
@@ -513,7 +515,7 @@ export async function runPull(
             notes[record.recordName] = advancedEntry(existing.file, undefined);
             const movedRemark: PullChangeRemark = {
               tone: "note",
-              message: `moved here locally from ${existing.file} - "push" sends the move`,
+              message: `moved here locally from ${existing.file} - "push" sends the move, or says why it can't`,
             };
             if (followed.status === "conflict") {
               summary.conflicts.push(`${followed.file}: merged with conflict markers - resolve manually`);
@@ -1131,11 +1133,11 @@ export interface MovedFileTitles {
 export async function followLocalMove(
   targetDir: string,
   recordName: string,
-  untrackedIds: ReadonlyMap<string, readonly string[]>,
+  untracked: UntrackedNoteIdIndex,
   remoteBodyText: string,
   titles: MovedFileTitles,
 ): Promise<LocalMoveOutcome> {
-  const claimants = untrackedIds.get(recordName) ?? [];
+  const claimants = untracked.claims.get(recordName) ?? [];
   if (claimants.length > 1) {
     return {
       kind: "recreate",
@@ -1146,6 +1148,16 @@ export async function followLocalMove(
   }
   const movedFile = claimants[0];
   if (movedFile === undefined) {
+    // An unreadable file may be where it went; nothing can be merged into
+    // it, but the user should hear why a duplicate may be about to appear.
+    if (untracked.unreadable.length > 0) {
+      return {
+        kind: "recreate",
+        warning:
+          `${untracked.unreadable.join(", ")} couldn't be read to check whether it was moved there - if it was, ` +
+          "make it readable and delete one of the two copies before pushing, or the other goes up as a new note",
+      };
+    }
     return { kind: "recreate" };
   }
   const merged = await mergeRemoteChangeIntoMovedFile(targetDir, recordName, movedFile, remoteBodyText, titles);
