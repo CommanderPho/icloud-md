@@ -158,6 +158,47 @@ test("a record repeated across pages of one private walk comes back once", async
   }
 });
 
+test("an incremental private walk lets a tombstone on one page win over a live copy on a later one", async () => {
+  const restore = installFetchMock([
+    zonePage([{ recordName: "note-1", deleted: true }], "t1", true),
+    zonePage([wireNote("note-1", "tag-1", 1_000)], "t2", false),
+  ]);
+  try {
+    const result = await fetchAllNoteRecords(session, "https://ckdatabasews.example", "12345", "t0");
+
+    assert.deepEqual(
+      result.records.map((entry) => [entry.recordName, entry.deleted === true]),
+      [["note-1", true]],
+    );
+    assert.equal(result.syncToken, "t2");
+  } finally {
+    restore();
+  }
+});
+
+test("a record repeated across pages of one shared zone comes back once", async () => {
+  const restore = installFetchMock([
+    { moreComing: false, zones: [{ zoneID: { zoneName: "Notes", ownerRecordName: "_ownerA" } }] },
+    zonePage([wireNote("note-1", "tag-old", 1_000), wireNote("note-2", "tag-2", 1_000)], "t1", true, "_ownerA"),
+    zonePage([wireNote("note-1", "tag-new", 2_000)], "t2", false, "_ownerA"),
+  ]);
+  try {
+    const result = await fetchSharedNoteRecords(session, "https://ckdatabasews.example", "12345");
+
+    assert.deepEqual(
+      result.zones.map((zone) => zone.records.map((entry) => [entry.recordName, entry.recordChangeTag])),
+      [
+        [
+          ["note-1", "tag-new"],
+          ["note-2", "tag-2"],
+        ],
+      ],
+    );
+  } finally {
+    restore();
+  }
+});
+
 test("fetchAllZoneRecords collapses a repeated record too", async () => {
   const restore = installFetchMock([
     zonePage([wireNote("note-1", "tag-old", 1_000)], "t1", true),

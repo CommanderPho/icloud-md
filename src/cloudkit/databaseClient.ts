@@ -335,9 +335,12 @@ export async function fetchAllZoneRecords(
  * in another zone is a different record and is never collapsed here. Which
  * occurrence wins doesn't depend on listing order:
  *
- * - A tombstone beats any live copy. A deleted record doesn't come back under
- *   the same name, so a deletion seen anywhere in the walk is the newest
- *   state of that record.
+ * - A tombstone beats any live copy. That relies on a deleted record's name
+ *   never being reused, which holds for notes (their names are UUIDs) but
+ *   isn't a CloudKit guarantee: a fixed-name record like
+ *   `DefaultFolder-CloudKit`, deleted and recreated between two pages of one
+ *   walk, would lose its live copy here. A tombstone carries no `modified`,
+ *   so there's no timestamp to settle that case with.
  * - Between live copies, the greater `modified.timestamp` wins, and a copy
  *   without one ranks below any copy that has one.
  * - Only an exact tie falls back to position, and goes to the later
