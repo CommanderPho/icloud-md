@@ -59,7 +59,9 @@ icloud-md push
 - **Conflict-awareness**: If a note changed in iCloud
   since your last sync *and* you edited it locally, `pull` does a real
   three-way merge and only asks you to resolve the parts that actually
-  overlap — the rest merges automatically.
+  overlap — the rest merges automatically. A note you edited locally but
+  deleted on another device keeps your edits: `pull` stops tracking it, and
+  the next `push` creates it again as a new note.
 - **`git`-flavored CLI**: You're probably already familiar with what the
   various `git` commands do; that knowledge is most of what you need to
   know to use this tool.

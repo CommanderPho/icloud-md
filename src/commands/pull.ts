@@ -29,7 +29,7 @@ import { localFileState } from "../notes/localFileState.js";
 import { writeCloneState, type CloneState, type CloneStateNoteEntry, type TitleMode } from "../notes/cloneState.js";
 import { migrationReporter, openVault } from "../notes/vaultMigrations.js";
 import { pendingRenameTarget, settlePendingRenames } from "../notes/pendingRename.js";
-import { composeNoteFile, NOTE_TITLE_KEY } from "../notes/noteIdFrontmatter.js";
+import { clearNoteId, composeNoteFile, NOTE_TITLE_KEY } from "../notes/noteIdFrontmatter.js";
 import { recordEpoch } from "../notes/noteEpoch.js";
 import { applyNoteFileTimes, modificationDateOf } from "../notes/noteTimestamps.js";
 import { recordVersion } from "../notes/versionHistory.js";
@@ -42,7 +42,8 @@ export type PullNotice = SyncNotice;
 
 /** Which of the ways a pull can touch a local file this change represents.
  * "untrack" is a note left on disk but dropped from tracking (it became
- * unsyncable remotely) - the file stays, the sync relationship goes. */
+ * unsyncable remotely, or was deleted remotely while it had local edits) -
+ * the file stays, the sync relationship goes. */
 export type PullChangeKind = "add" | "update" | "merge" | "remove" | "move" | "untrack";
 
 export interface PullChangeRemark {
@@ -840,7 +841,7 @@ async function handleVanishedSharedZones(
  * zone) whose record appears nowhere in the zone's complete listing no
  * longer exists remotely, and goes through the same remote-deletion handling
  * a tombstone would have driven - a clean local copy is removed, one with
- * local edits becomes a delete/modify conflict and stays put.
+ * local edits stays on disk, untracked, as a new note for the next push.
  *
  * `seenRecordNames` must come from the *complete* listing, every record type
  * included: matching on Note records alone would misread a record whose type
@@ -900,25 +901,34 @@ async function handleRemoteDeletion(
     return;
   }
 
-  // A delete/modify conflict is never auto-resolved either direction - merge
-  // against an empty remote so the markers show exactly what local kept. The
-  // local-only frontmatter is split off first and kept above the markers.
-  const base = (await readBaseCopy(targetDir, record.recordName)) ?? "";
-  const { frontmatter, body: localContent } = splitFrontmatter(await readFile(path.join(targetDir, existing.file), "utf-8"), {
+  // Local edits to a note deleted elsewhere are kept as a *new* note: the file
+  // stays, edits and all, but stops being tracked and loses its
+  // `apple-note-id`, so the next push creates it. Keeping it tracked behind
+  // delete/modify conflict markers (what this used to do) left it stuck for
+  // good - push can't update a record that no longer exists, and no later
+  // pull ever delivers that record again to settle it. Its attachment files
+  // stay on disk too, since the kept text still points at them and the
+  // remote copies are gone; only their tracking goes.
+  const filePath = path.join(targetDir, existing.file);
+  const { frontmatter, body } = splitFrontmatter(await readFile(filePath, "utf-8"), {
     filenameAsTitle: titleMode === "filename",
   });
-  const outcome = mergeNoteVersions(base, localContent, "");
-
-  await writeFile(path.join(targetDir, existing.file), joinFrontmatter(frontmatter, outcome.text), "utf-8");
-  summary.conflicts.push(`${existing.file}: deleted remotely, but has local edits - merged with conflict markers, resolve manually`);
+  await writeFile(filePath, joinFrontmatter(clearNoteId(frontmatter), body), "utf-8");
+  delete notes[record.recordName];
+  await removeBaseCopy(targetDir, record.recordName);
+  for (const [attachmentRecordName, attachment] of Object.entries(attachments)) {
+    if (attachment.noteRecordName === record.recordName) {
+      delete attachments[attachmentRecordName];
+    }
+  }
+  for (const removed of removeTableAttachmentsForNote(record.recordName, tableAttachments)) {
+    delete tableAttachments[removed];
+  }
   summary.changes.push({
-    kind: "update",
+    kind: "untrack",
     file: existing.file,
-    remarks: [{ tone: "conflict", message: "deleted remotely, but has local edits - merged with conflict markers, resolve manually" }],
+    remarks: [{ tone: "note", message: "deleted on another device, but has local edits - kept as a new note, which the next push creates" }],
   });
-  // Keep tracking (state entry + base copy) so this doesn't silently drop
-  // out of state.json; there's no new recordChangeTag to advance to since
-  // the record no longer exists remotely.
 }
 
 /**
