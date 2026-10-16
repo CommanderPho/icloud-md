@@ -257,7 +257,10 @@ export async function fetchZoneNoteRecords(
       onPage?.(pageRecords.length);
     }
 
-    return { records, syncToken };
+    return {
+      records: await dedupeWalkRecords(records, `fetchZoneNoteRecords (${database} zone ${zoneID.ownerRecordName ?? "Notes"})`),
+      syncToken,
+    };
   };
 
   if (sinceSyncToken === undefined) {
@@ -318,7 +321,80 @@ export async function fetchAllZoneRecords(
     onPage?.((zone.records ?? []).length);
   }
 
-  return records;
+  return dedupeWalkRecords(records, "fetchAllZoneRecords");
+}
+
+/**
+ * Collapses repeated occurrences of a record in one zone's `changes/zone`
+ * walk. CloudKit occasionally lists the same record on two pages of a single
+ * walk (issue #32: about 1 clone in 9 on a 118-note account). Kept as-is,
+ * clone writes that note twice - the second copy under a uniquified name and
+ * untracked - and the next push creates it in iCloud as a brand-new note.
+ *
+ * Callers pass one zone's records, so `recordName` is the key: the same name
+ * in another zone is a different record and is never collapsed here. Which
+ * occurrence wins doesn't depend on listing order:
+ *
+ * - A tombstone beats any live copy. That relies on a deleted record's name
+ *   never being reused, which holds for notes (their names are UUIDs) but
+ *   isn't a CloudKit guarantee: a fixed-name record like
+ *   `DefaultFolder-CloudKit`, deleted and recreated between two pages of one
+ *   walk, would lose its live copy here. A tombstone carries no `modified`,
+ *   so there's no timestamp to settle that case with.
+ * - Between live copies, the greater `modified.timestamp` wins, and a copy
+ *   without one ranks below any copy that has one.
+ * - Only an exact tie falls back to position, and goes to the later
+ *   occurrence. Private walks send `reverse: true`, and nothing captured so
+ *   far shows which way that orders a repeat, so "later" here is a tiebreak,
+ *   not evidence of recency.
+ *
+ * Change tags are opaque rather than ordered, so they are never compared. The
+ * winner takes the first occurrence's position, keeping file naming in
+ * listing order of first appearance.
+ *
+ * Ported from ferdousbhai/icloud-for-omarchy@fc242a5.
+ */
+export function dedupeZoneRecords(records: CloudKitRecord[]): CloudKitRecord[] {
+  // Map.set on an existing key keeps that key's original insertion position.
+  const winners = new Map<string, CloudKitRecord>();
+  for (const record of records) {
+    const kept = winners.get(record.recordName);
+    if (kept === undefined || recencyRank(record) >= recencyRank(kept)) {
+      winners.set(record.recordName, record);
+    }
+  }
+  return [...winners.values()];
+}
+
+/** How recent an occurrence is for `dedupeZoneRecords`: tombstones first,
+ * then live copies by `modified.timestamp`, with no timestamp lowest. */
+function recencyRank(record: CloudKitRecord): number {
+  if (record.deleted === true) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return record.modified?.timestamp ?? Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * `dedupeZoneRecords` for a finished walk, logging any record it collapsed.
+ * We haven't yet seen CloudKit repeat a record on a real account, so the
+ * debug log is the only evidence a repeat leaves behind once it's collapsed -
+ * including for anyone chasing issue #32 with `object list`.
+ */
+async function dedupeWalkRecords(records: CloudKitRecord[], context: string): Promise<CloudKitRecord[]> {
+  const deduped = dedupeZoneRecords(records);
+  if (deduped.length === records.length) {
+    return deduped;
+  }
+  const counts = new Map<string, number>();
+  for (const record of records) {
+    counts.set(record.recordName, (counts.get(record.recordName) ?? 0) + 1);
+  }
+  const repeats = [...counts].filter(([, count]) => count > 1).map(([name, count]) => `${name} x${count}`);
+  await appendDebugLog({
+    note: `${context}: collapsed ${records.length - deduped.length} repeated record listing(s) in one walk: ${repeats.join(", ")}`,
+  });
+  return deduped;
 }
 
 /** Fetches records in the account's own (private-database) Notes zone. */
@@ -380,7 +456,17 @@ export async function fetchSharedZoneIds(
     moreComing = page.moreComing;
   }
 
-  return zoneIds;
+  // A zone listed on two pages would otherwise be fetched - and its notes
+  // cloned - twice; see `dedupeZoneRecords` for the record-level version.
+  const seen = new Set<string>();
+  return zoneIds.filter((zoneID) => {
+    const key = JSON.stringify([zoneID.zoneName, zoneID.ownerRecordName ?? null]);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 /** One page of a shared `changes/database` listing; `moreComing`/`syncToken`
