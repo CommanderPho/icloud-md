@@ -1,6 +1,6 @@
 import type { IcloudSession } from "../session.js";
 import { appendDebugLog, loggedFetch } from "../debugLog.js";
-import { CloudKitRequestFailedError, CloudKitZoneFetchFailedError } from "../errors.js";
+import { CloudKitRequestFailedError, CloudKitSyncTokenStalledError, CloudKitZoneFetchFailedError } from "../errors.js";
 import { isDeletedNote } from "../notes/decodeNoteRecord.js";
 
 export interface CloudKitFieldValue {
@@ -211,6 +211,13 @@ async function postDatabase(
  * something else in the request, the token-free retry hits it identically
  * and that error propagates - the fallback only "sticks" when dropping the
  * token was the fix.
+ *
+ * A page that says `moreComing` without advancing the syncToken throws
+ * `CloudKitSyncTokenStalledError` (see `assertPageAdvances`) and doesn't
+ * trigger that fallback. The server answered the token rather than rejecting
+ * it, so the guess is that dropping it isn't the fix - but a stall has never
+ * been observed, so that's a guess. If the stored private token itself is
+ * what's stuck, re-cloning into a new folder is the only way past it today.
  */
 export async function fetchZoneNoteRecords(
   session: IcloudSession,
@@ -255,13 +262,21 @@ export async function fetchZoneNoteRecords(
       const pageRecords = zone.records ?? [];
 
       records.push(...pageRecords);
-      syncToken = zone.syncToken ?? syncToken;
+      assertPageAdvances(`${database} changes/zone`, zone, syncToken, { startedFromStoredToken: Boolean(startToken) });
+      // `||`, not `??`: an empty token is no token (see `assertPageAdvances`),
+      // and saving one would make the next pull silently walk from scratch.
+      syncToken = zone.syncToken || syncToken;
       moreComing = zone.moreComing === true;
       onPage?.(pageRecords.length);
     }
 
-    await inlineAssetBodies(records, { session, ckDatabaseHost, dsid, database, zoneID });
-    return { records, syncToken };
+    // Dedupe first, so a record listed twice has its asset downloaded once.
+    const deduped = await dedupeWalkRecords(
+      records,
+      `fetchZoneNoteRecords (${database} zone ${zoneID.ownerRecordName ?? "Notes"})`,
+    );
+    await inlineAssetBodies(deduped, { session, ckDatabaseHost, dsid, database, zoneID });
+    return { records: deduped, syncToken };
   };
 
   if (sinceSyncToken === undefined) {
@@ -317,12 +332,86 @@ export async function fetchAllZoneRecords(
     );
     const zone = firstZone(body);
     records.push(...(zone.records ?? []));
-    syncToken = zone.syncToken ?? syncToken;
+    assertPageAdvances("private changes/zone", zone, syncToken, { startedFromStoredToken: false });
+    syncToken = zone.syncToken || syncToken;
     moreComing = zone.moreComing === true;
     onPage?.((zone.records ?? []).length);
   }
 
-  return records;
+  return dedupeWalkRecords(records, "fetchAllZoneRecords");
+}
+
+/**
+ * Collapses repeated occurrences of a record in one zone's `changes/zone`
+ * walk. CloudKit occasionally lists the same record on two pages of a single
+ * walk (issue #32: about 1 clone in 9 on a 118-note account). Kept as-is,
+ * clone writes that note twice - the second copy under a uniquified name and
+ * untracked - and the next push creates it in iCloud as a brand-new note.
+ *
+ * Callers pass one zone's records, so `recordName` is the key: the same name
+ * in another zone is a different record and is never collapsed here. Which
+ * occurrence wins doesn't depend on listing order:
+ *
+ * - A tombstone beats any live copy. That relies on a deleted record's name
+ *   never being reused, which holds for notes (their names are UUIDs) but
+ *   isn't a CloudKit guarantee: a fixed-name record like
+ *   `DefaultFolder-CloudKit`, deleted and recreated between two pages of one
+ *   walk, would lose its live copy here. A tombstone carries no `modified`,
+ *   so there's no timestamp to settle that case with.
+ * - Between live copies, the greater `modified.timestamp` wins, and a copy
+ *   without one ranks below any copy that has one.
+ * - Only an exact tie falls back to position, and goes to the later
+ *   occurrence. Private walks send `reverse: true`, and nothing captured so
+ *   far shows which way that orders a repeat, so "later" here is a tiebreak,
+ *   not evidence of recency.
+ *
+ * Change tags are opaque rather than ordered, so they are never compared. The
+ * winner takes the first occurrence's position, keeping file naming in
+ * listing order of first appearance.
+ *
+ * Ported from ferdousbhai/icloud-for-omarchy@fc242a5.
+ */
+export function dedupeZoneRecords(records: CloudKitRecord[]): CloudKitRecord[] {
+  // Map.set on an existing key keeps that key's original insertion position.
+  const winners = new Map<string, CloudKitRecord>();
+  for (const record of records) {
+    const kept = winners.get(record.recordName);
+    if (kept === undefined || recencyRank(record) >= recencyRank(kept)) {
+      winners.set(record.recordName, record);
+    }
+  }
+  return [...winners.values()];
+}
+
+/** How recent an occurrence is for `dedupeZoneRecords`: tombstones first,
+ * then live copies by `modified.timestamp`, with no timestamp lowest. */
+function recencyRank(record: CloudKitRecord): number {
+  if (record.deleted === true) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return record.modified?.timestamp ?? Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * `dedupeZoneRecords` for a finished walk, logging any record it collapsed.
+ * We haven't yet seen CloudKit repeat a record on a real account, so the
+ * debug log is the only evidence a repeat leaves behind once it's collapsed -
+ * including for anyone chasing issue #32 with `object list`.
+ */
+async function dedupeWalkRecords(records: CloudKitRecord[], context: string): Promise<CloudKitRecord[]> {
+  const deduped = dedupeZoneRecords(records);
+  if (deduped.length === records.length) {
+    return deduped;
+  }
+  const counts = new Map<string, number>();
+  for (const record of records) {
+    counts.set(record.recordName, (counts.get(record.recordName) ?? 0) + 1);
+  }
+  const repeats = [...counts].filter(([, count]) => count > 1).map(([name, count]) => `${name} x${count}`);
+  await appendDebugLog({
+    note: `${context}: collapsed ${records.length - deduped.length} repeated record listing(s) in one walk: ${repeats.join(", ")}`,
+  });
+  return deduped;
 }
 
 /** Fetches records in the account's own (private-database) Notes zone. */
@@ -372,19 +461,24 @@ export async function fetchSharedZoneIds(
     );
     const page = parseSharedZoneList(body);
     zoneIds.push(...page.zoneIds);
-    // Without a fresh token, a continuation request would replay this same
-    // page forever. The web client treats this as fatal too ("Critical CK
-    // Error: Server returned the same sync token").
-    if (page.moreComing && (page.syncToken === undefined || page.syncToken === syncToken)) {
-      throw new CloudKitRequestFailedError(
-        "shared changes/database reported moreComing without a new syncToken; refusing to re-request the same page",
-      );
-    }
-    syncToken = page.syncToken ?? syncToken;
+    // The web client treats this as fatal too ("Critical CK Error: Server
+    // returned the same sync token").
+    assertPageAdvances("shared changes/database", page, syncToken, { startedFromStoredToken: false });
+    syncToken = page.syncToken || syncToken;
     moreComing = page.moreComing;
   }
 
-  return zoneIds;
+  // A zone listed on two pages would otherwise be fetched - and its notes
+  // cloned - twice; see `dedupeZoneRecords` for the record-level version.
+  const seen = new Set<string>();
+  return zoneIds.filter((zoneID) => {
+    const key = JSON.stringify([zoneID.zoneName, zoneID.ownerRecordName ?? null]);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 /** One page of a shared `changes/database` listing; `moreComing`/`syncToken`
@@ -492,7 +586,7 @@ async function lookupRecordsWithMisses(
 }
 
 /** A shared zone whose fetch didn't complete this run, skipped rather than
- * fatal; see `fetchSharedNoteRecords`. Two distinct shapes:
+ * fatal; see `fetchSharedNoteRecords`. Three distinct shapes:
  *
  * - `"zone-not-found"`: `changes/zone` answered ZONE_NOT_FOUND for a zone the
  *   `changes/database` listing advertised - a share revoked or deleted out
@@ -503,10 +597,17 @@ async function lookupRecordsWithMisses(
  *   between listing and lookup). Processing the zone anyway would classify
  *   those notes unsyncable and permanently untrack them over what is usually
  *   a transient failure - so the whole zone waits for a later pull, and its
- *   syncToken must not advance. */
+ *   syncToken must not advance.
+ * - `"stalled-sync-token"`: a `changes/zone` page said `moreComing` without
+ *   handing back a new syncToken (see `assertPageAdvances`). The zone's
+ *   listing is incomplete, so nothing from it is processed and its token
+ *   stays put - the same as a missing-bodies skip - but the rest of the pull
+ *   goes ahead rather than one sharer's stuck zone blocking the user's own
+ *   notes. */
 export type SkippedSharedZone =
   | { zoneID: CloudKitZoneID; reason: "zone-not-found"; serverErrorCode: string }
-  | { zoneID: CloudKitZoneID; reason: "missing-note-bodies"; missingRecordNames: string[] };
+  | { zoneID: CloudKitZoneID; reason: "missing-note-bodies"; missingRecordNames: string[] }
+  | { zoneID: CloudKitZoneID; reason: "stalled-sync-token" };
 
 /** "3 note(s) (A, B, C)" for a missing-note-bodies skip, naming at most five
  * records - enough to find the one note that holds a zone back every pull
@@ -535,9 +636,9 @@ export interface SharedNoteRecordsResult {
  * zone's successful results. So is a zone with note bodies still missing
  * after the lookup backfill (see `SkippedSharedZone`): its results are
  * incomplete, and acting on them would untrack notes over a transient
- * failure. Any other zone-level error stays fatal: that's a broken fetch,
- * not a missing zone, and swallowing it would make it look like a clean
- * sync.
+ * failure. So is a zone whose paging stalls (see `SkippedSharedZone`). Any
+ * other zone-level error stays fatal: that's a broken fetch, not a missing
+ * zone, and swallowing it would make it look like a clean sync.
  */
 export async function fetchSharedNoteRecords(
   session: IcloudSession,
@@ -596,6 +697,10 @@ export async function fetchSharedNoteRecords(
     } catch (error) {
       if (error instanceof CloudKitZoneFetchFailedError && error.serverErrorCode === "ZONE_NOT_FOUND") {
         skippedZones.push({ zoneID, reason: "zone-not-found", serverErrorCode: error.serverErrorCode });
+        continue;
+      }
+      if (error instanceof CloudKitSyncTokenStalledError) {
+        skippedZones.push({ zoneID, reason: "stalled-sync-token" });
         continue;
       }
       throw error;
@@ -1098,6 +1203,29 @@ export function firstZone(body: unknown): ParsedZone {
     syncToken: typeof zone.syncToken === "string" ? zone.syncToken : undefined,
     records,
   };
+}
+
+/**
+ * Guards every paged listing (`changes/zone` and `changes/database`): a page
+ * that says `moreComing` but hands back no syncToken, or the one the request
+ * carried, would have the paging loop request that same page forever. An
+ * empty token counts as none, since every request builder here skips a falsy
+ * token - letting `""` through would silently restart the walk from scratch.
+ * Throws rather than looping; nothing gathered so far is returned, so the
+ * caller keeps its old token and a partial listing is never acted on.
+ *
+ * Only the token just sent is compared, so a server cycling between tokens
+ * (`A -> B -> A ...`) would still page without end; that has never been seen.
+ */
+function assertPageAdvances(
+  label: string,
+  page: { moreComing?: boolean | undefined; syncToken?: string | undefined },
+  requestToken: string | undefined,
+  options: { startedFromStoredToken: boolean },
+): void {
+  if (page.moreComing === true && (!page.syncToken || page.syncToken === requestToken)) {
+    throw new CloudKitSyncTokenStalledError(label, options);
+  }
 }
 
 /**
