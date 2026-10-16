@@ -7,6 +7,7 @@ import {
   lookupRecords,
   type CloudKitRecord,
   type SharedZoneChanges,
+  type SkippedSharedZone,
 } from "../cloudkit/databaseClient.js";
 import type { IcloudSession } from "../session.js";
 import {
@@ -219,16 +220,7 @@ export async function runPull(
     if (owner && carried) {
       sharedZoneSyncTokens[owner] = carried;
     }
-    summary.notices.push({
-      level: "warn",
-      message:
-        skipped.reason === "zone-not-found"
-          ? `Skipped a shared zone the server no longer has (owner ${owner ?? "unknown"}, ${skipped.serverErrorCode}) - ` +
-            "its share was likely revoked or deleted; its local notes were left in place and stay tracked for now"
-          : `Skipped the shared zone owned by ${owner ?? "unknown"} this run: ${skipped.missingRecordNames.length} ` +
-            "note(s) came through without their text and looking them up didn't fill it in - nothing from that zone " +
-            "was touched, and the next pull will retry it",
-    });
+    summary.notices.push({ level: "warn", message: skippedZoneNotice(skipped, owner) });
   }
 
   // Rebuild the directory layout from carried state + this run's folder
@@ -792,6 +784,29 @@ export async function renameForRemoteTitle(
 function remarksFor(leading: PullChangeRemark[], unpublishableReason: string | undefined): { remarks?: PullChangeRemark[] } {
   const remarks = [...leading, ...(unpublishableReason !== undefined ? [READ_ONLY_REMARK] : [])];
   return remarks.length > 0 ? { remarks } : {};
+}
+
+/** The warning a pull prints for a shared zone `fetchSharedNoteRecords` skipped. */
+function skippedZoneNotice(skipped: SkippedSharedZone, owner: string | undefined): string {
+  switch (skipped.reason) {
+    case "zone-not-found":
+      return (
+        `Skipped a shared zone the server no longer has (owner ${owner ?? "unknown"}, ${skipped.serverErrorCode}) - ` +
+        "its share was likely revoked or deleted; its local notes were left in place and stay tracked for now"
+      );
+    case "missing-note-bodies":
+      return (
+        `Skipped the shared zone owned by ${owner ?? "unknown"} this run: ${skipped.missingRecordNames.length} ` +
+        "note(s) came through without their text and looking them up didn't fill it in - nothing from that zone " +
+        "was touched, and the next pull will retry it"
+      );
+    case "stalled-sync-token":
+      return (
+        `Skipped the shared zone owned by ${owner ?? "unknown"} this run: iCloud kept handing back the same page of ` +
+        "changes for it - nothing from that zone was touched. A retry sends the same request, so if this keeps " +
+        "happening, please open a GitHub issue including this message"
+      );
+  }
 }
 
 /** The per-directory used-names set, created on first use. */

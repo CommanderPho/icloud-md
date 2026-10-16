@@ -1,6 +1,6 @@
 import type { IcloudSession } from "../session.js";
 import { appendDebugLog, loggedFetch } from "../debugLog.js";
-import { CloudKitRequestFailedError, CloudKitZoneFetchFailedError } from "../errors.js";
+import { CloudKitRequestFailedError, CloudKitSyncTokenStalledError, CloudKitZoneFetchFailedError } from "../errors.js";
 
 export interface CloudKitFieldValue {
   value: unknown;
@@ -208,6 +208,13 @@ async function postDatabase(
  * something else in the request, the token-free retry hits it identically
  * and that error propagates - the fallback only "sticks" when dropping the
  * token was the fix.
+ *
+ * A page that says `moreComing` without advancing the syncToken throws
+ * `CloudKitSyncTokenStalledError` (see `assertPageAdvances`) and doesn't
+ * trigger that fallback. The server answered the token rather than rejecting
+ * it, so the guess is that dropping it isn't the fix - but a stall has never
+ * been observed, so that's a guess. If the stored private token itself is
+ * what's stuck, re-cloning into a new folder is the only way past it today.
  */
 export async function fetchZoneNoteRecords(
   session: IcloudSession,
@@ -252,7 +259,10 @@ export async function fetchZoneNoteRecords(
       const pageRecords = zone.records ?? [];
 
       records.push(...pageRecords);
-      syncToken = zone.syncToken ?? syncToken;
+      assertPageAdvances(`${database} changes/zone`, zone, syncToken, { startedFromStoredToken: Boolean(startToken) });
+      // `||`, not `??`: an empty token is no token (see `assertPageAdvances`),
+      // and saving one would make the next pull silently walk from scratch.
+      syncToken = zone.syncToken || syncToken;
       moreComing = zone.moreComing === true;
       onPage?.(pageRecords.length);
     }
@@ -316,7 +326,8 @@ export async function fetchAllZoneRecords(
     );
     const zone = firstZone(body);
     records.push(...(zone.records ?? []));
-    syncToken = zone.syncToken ?? syncToken;
+    assertPageAdvances("private changes/zone", zone, syncToken, { startedFromStoredToken: false });
+    syncToken = zone.syncToken || syncToken;
     moreComing = zone.moreComing === true;
     onPage?.((zone.records ?? []).length);
   }
@@ -444,15 +455,10 @@ export async function fetchSharedZoneIds(
     );
     const page = parseSharedZoneList(body);
     zoneIds.push(...page.zoneIds);
-    // Without a fresh token, a continuation request would replay this same
-    // page forever. The web client treats this as fatal too ("Critical CK
-    // Error: Server returned the same sync token").
-    if (page.moreComing && (page.syncToken === undefined || page.syncToken === syncToken)) {
-      throw new CloudKitRequestFailedError(
-        "shared changes/database reported moreComing without a new syncToken; refusing to re-request the same page",
-      );
-    }
-    syncToken = page.syncToken ?? syncToken;
+    // The web client treats this as fatal too ("Critical CK Error: Server
+    // returned the same sync token").
+    assertPageAdvances("shared changes/database", page, syncToken, { startedFromStoredToken: false });
+    syncToken = page.syncToken || syncToken;
     moreComing = page.moreComing;
   }
 
@@ -556,7 +562,7 @@ export async function lookupRecords(
 }
 
 /** A shared zone whose fetch didn't complete this run, skipped rather than
- * fatal; see `fetchSharedNoteRecords`. Two distinct shapes:
+ * fatal; see `fetchSharedNoteRecords`. Three distinct shapes:
  *
  * - `"zone-not-found"`: `changes/zone` answered ZONE_NOT_FOUND for a zone the
  *   `changes/database` listing advertised - a share revoked or deleted out
@@ -567,10 +573,17 @@ export async function lookupRecords(
  *   between listing and lookup). Processing the zone anyway would classify
  *   those notes unsyncable and permanently untrack them over what is usually
  *   a transient failure - so the whole zone waits for a later pull, and its
- *   syncToken must not advance. */
+ *   syncToken must not advance.
+ * - `"stalled-sync-token"`: a `changes/zone` page said `moreComing` without
+ *   handing back a new syncToken (see `assertPageAdvances`). The zone's
+ *   listing is incomplete, so nothing from it is processed and its token
+ *   stays put - the same as a missing-bodies skip - but the rest of the pull
+ *   goes ahead rather than one sharer's stuck zone blocking the user's own
+ *   notes. */
 export type SkippedSharedZone =
   | { zoneID: CloudKitZoneID; reason: "zone-not-found"; serverErrorCode: string }
-  | { zoneID: CloudKitZoneID; reason: "missing-note-bodies"; missingRecordNames: string[] };
+  | { zoneID: CloudKitZoneID; reason: "missing-note-bodies"; missingRecordNames: string[] }
+  | { zoneID: CloudKitZoneID; reason: "stalled-sync-token" };
 
 export interface SharedNoteRecordsResult {
   zones: SharedZoneChanges[];
@@ -589,9 +602,9 @@ export interface SharedNoteRecordsResult {
  * zone's successful results. So is a zone with note bodies still missing
  * after the lookup backfill (see `SkippedSharedZone`): its results are
  * incomplete, and acting on them would untrack notes over a transient
- * failure. Any other zone-level error stays fatal: that's a broken fetch,
- * not a missing zone, and swallowing it would make it look like a clean
- * sync.
+ * failure. So is a zone whose paging stalls (see `SkippedSharedZone`). Any
+ * other zone-level error stays fatal: that's a broken fetch, not a missing
+ * zone, and swallowing it would make it look like a clean sync.
  */
 export async function fetchSharedNoteRecords(
   session: IcloudSession,
@@ -649,6 +662,10 @@ export async function fetchSharedNoteRecords(
     } catch (error) {
       if (error instanceof CloudKitZoneFetchFailedError && error.serverErrorCode === "ZONE_NOT_FOUND") {
         skippedZones.push({ zoneID, reason: "zone-not-found", serverErrorCode: error.serverErrorCode });
+        continue;
+      }
+      if (error instanceof CloudKitSyncTokenStalledError) {
+        skippedZones.push({ zoneID, reason: "stalled-sync-token" });
         continue;
       }
       throw error;
@@ -1026,6 +1043,29 @@ export function firstZone(body: unknown): ParsedZone {
     syncToken: typeof zone.syncToken === "string" ? zone.syncToken : undefined,
     records,
   };
+}
+
+/**
+ * Guards every paged listing (`changes/zone` and `changes/database`): a page
+ * that says `moreComing` but hands back no syncToken, or the one the request
+ * carried, would have the paging loop request that same page forever. An
+ * empty token counts as none, since every request builder here skips a falsy
+ * token - letting `""` through would silently restart the walk from scratch.
+ * Throws rather than looping; nothing gathered so far is returned, so the
+ * caller keeps its old token and a partial listing is never acted on.
+ *
+ * Only the token just sent is compared, so a server cycling between tokens
+ * (`A -> B -> A ...`) would still page without end; that has never been seen.
+ */
+function assertPageAdvances(
+  label: string,
+  page: { moreComing?: boolean | undefined; syncToken?: string | undefined },
+  requestToken: string | undefined,
+  options: { startedFromStoredToken: boolean },
+): void {
+  if (page.moreComing === true && (!page.syncToken || page.syncToken === requestToken)) {
+    throw new CloudKitSyncTokenStalledError(label, options);
+  }
 }
 
 /**
