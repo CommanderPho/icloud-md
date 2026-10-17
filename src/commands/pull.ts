@@ -30,7 +30,15 @@ import { localFileState, readLocalNote } from "../notes/localFileState.js";
 import { writeCloneState, type CloneState, type CloneStateNoteEntry, type TitleMode } from "../notes/cloneState.js";
 import { migrationReporter, openVault } from "../notes/vaultMigrations.js";
 import { pendingRenameTarget, settlePendingRenames } from "../notes/pendingRename.js";
-import { composeNoteFile, NOTE_TITLE_KEY } from "../notes/noteIdFrontmatter.js";
+import {
+  clearNoteTitle,
+  composeNoteFile,
+  NOTE_ID_KEY,
+  NOTE_TITLE_KEY,
+  readNoteTitle,
+  setNoteTitle,
+} from "../notes/noteIdFrontmatter.js";
+import { forgetIndexedFile, indexUntrackedNoteIds, type UntrackedNoteIdIndex } from "../notes/untrackedFiles.js";
 import { recordEpoch } from "../notes/noteEpoch.js";
 import { applyNoteFileTimes, modificationDateOf } from "../notes/noteTimestamps.js";
 import { recordVersion } from "../notes/versionHistory.js";
@@ -234,6 +242,10 @@ export async function runPull(
   for (const dir of layout.allDirs) {
     await mkdir(path.join(targetDir, dir), { recursive: true });
   }
+
+  // Where hand-moved notes went, by `apple-note-id` - built the first time a
+  // tracked file turns up missing, since most pulls never need it.
+  let movedFileIndex: UntrackedNoteIdIndex | undefined;
 
   const totalRecords = sources.reduce((sum, source) => sum + source.records.length, 0);
   progress?.onProcessStart?.(totalRecords);
@@ -459,6 +471,13 @@ export async function runPull(
           );
           await applyNoteFileTimes(filePath, record);
           await writeBaseCopy(targetDir, record.recordName, bodyText);
+          // The name is only unique among tracked files, so this may have
+          // just written over an untracked one the moved-file index holds.
+          // This only keeps the index honest; the overwrite itself predates
+          // following moves and isn't prevented here.
+          if (movedFileIndex !== undefined) {
+            forgetIndexedFile(movedFileIndex, relativeFile);
+          }
           notes[record.recordName] = {
             file: relativeFile,
             recordChangeTag: record.recordChangeTag ?? "",
@@ -478,6 +497,76 @@ export async function runPull(
         }
 
         const local = await localFileState(targetDir, existing, record.recordName, titleMode);
+
+        // What every branch that brings the remote change in records: its
+        // tag, date, placement and title, at the tracked path given.
+        const advancedEntry = (trackedFile: string, pendingRename: string | undefined): CloneStateNoteEntry => ({
+          ...existing,
+          file: trackedFile,
+          recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
+          modificationDate: modificationDateOf(record),
+          unpublishableReason,
+          folderRecordName: placement.folderRecordName,
+          frontmatterTitle: recordedTitle,
+          pendingRename,
+        });
+
+        // A missing file may only have been moved or renamed by hand, not
+        // deleted - and recreating it at the old path is then the worst thing
+        // to do: the original reappears beside the moved file, push reads the
+        // moved file as a copy, and the user's edits go up as a duplicate
+        // note. The moved file carries the note's id, so follow it there.
+        // Ahead of the remote-retitle rename below, which is for a file pull
+        // is about to write at its tracked path - and this one it isn't.
+        let recreateWarning: string | undefined;
+        if (local === "missing") {
+          movedFileIndex ??= await indexUntrackedNoteIds(targetDir, notes, titleMode);
+          const followed = await followLocalMove(targetDir, record.recordName, movedFileIndex, bodyText, {
+            previousTitle: existing.frontmatterTitle,
+            remoteTitle: recordedTitle,
+            titleMode,
+          });
+          if (followed.kind === "recreate") {
+            recreateWarning = followed.warning;
+          } else {
+            if (followed.status === "updated") {
+              await applyNoteFileTimes(path.join(targetDir, followed.file), record);
+            }
+            // The tracked path stays exactly where the note was - not even
+            // renamed for a remote retitle. The move is the user's and hasn't
+            // been pushed yet: push only sees it as a move while the tracked
+            // file is missing and the moved one untracked, and takes the
+            // note's previous title from the tracked path, so a retitled path
+            // here would read as the user retitling it back. A remote retitle
+            // reaches the file's name on the pull after the move is pushed.
+            notes[record.recordName] = advancedEntry(existing.file, undefined);
+            const movedRemark: PullChangeRemark = {
+              tone: "note",
+              message: `moved here locally from ${existing.file} - "push" sends the move, or says why it can't`,
+            };
+            if (followed.status === "conflict") {
+              summary.conflicts.push(`${followed.file}: merged with conflict markers - resolve manually`);
+              summary.changes.push({
+                kind: "merge",
+                file: followed.file,
+                remarks: [
+                  { tone: "conflict", message: "merged with conflict markers - resolve manually" },
+                  movedRemark,
+                  ...titleRemarks,
+                  ...(unpublishableReason !== undefined ? [READ_ONLY_REMARK] : []),
+                ],
+              });
+            } else {
+              summary[followed.status === "updated" ? "updated" : "merged"] += 1;
+              summary.changes.push({
+                kind: followed.status === "updated" ? "update" : "merge",
+                file: followed.file,
+                ...remarksFor([movedRemark, ...titleRemarks], unpublishableReason),
+              });
+            }
+            continue;
+          }
+        }
 
         // A remote retitle has to rename the file, because in this vault the
         // file name is the only place the title lives. Leaving it stale
@@ -523,18 +612,13 @@ export async function runPull(
           await applyNoteFileTimes(filePath, record);
           await writeBaseCopy(targetDir, record.recordName, bodyText);
           if (local === "missing") {
-            summary.notices.push({ level: "info", message: `Recreated ${file} (was missing locally)` });
+            summary.notices.push(
+              recreateWarning === undefined
+                ? { level: "info", message: `Recreated ${file} (was missing locally)` }
+                : { level: "warn", message: `Recreated ${file}: ${recreateWarning}` },
+            );
           }
-          notes[record.recordName] = {
-            ...existing,
-            file,
-            recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
-            modificationDate: modificationDateOf(record),
-            unpublishableReason,
-            folderRecordName: placement.folderRecordName,
-            frontmatterTitle: recordedTitle,
-            ...renameFields,
-          };
+          notes[record.recordName] = advancedEntry(file, pendingRename);
           summary.updated += 1;
           summary.changes.push({
             kind: "update",
@@ -579,16 +663,7 @@ export async function runPull(
           });
           continue;
         }
-        notes[record.recordName] = {
-          ...existing,
-          file,
-          recordChangeTag: record.recordChangeTag ?? existing.recordChangeTag,
-          modificationDate: modificationDateOf(record),
-          unpublishableReason,
-          folderRecordName: placement.folderRecordName,
-          frontmatterTitle: recordedTitle,
-          ...renameFields,
-        };
+        notes[record.recordName] = advancedEntry(file, pendingRename);
 
         if (merged.status === "conflict") {
           summary.conflicts.push(`${file}: merged with conflict markers - resolve manually`);
@@ -1196,6 +1271,140 @@ export async function mergeRemoteChangeIntoLocalFile(
     composeNoteFile(frontmatter, outcome.text, recordName, unrepresentableTitle),
     "utf-8",
   );
+  if (!outcome.hasConflict) {
+    await writeBaseCopy(targetDir, recordName, remoteBodyText);
+  }
+  return { status: outcome.hasConflict ? "conflict" : "merged" };
+}
+
+/** What pull does about a tracked note whose file is missing: follow it to
+ * the file it was moved to, or recreate it at its tracked path (with a
+ * `warning` saying why, when it isn't simply gone). */
+export type LocalMoveOutcome =
+  | { kind: "followed"; file: string; status: "updated" | "merged" | "conflict" }
+  | { kind: "recreate"; warning?: string | undefined };
+
+/** The note's `apple-note-title` as the last sync recorded it and as the
+ * remote change now has it (undefined: the name carries the title), so a
+ * key in the moved file that merely repeats the old one can be kept in
+ * step - see `mergeRemoteChangeIntoMovedFile`. */
+export interface MovedFileTitles {
+  previousTitle: string | undefined;
+  remoteTitle: string | undefined;
+  titleMode?: TitleMode | undefined;
+}
+
+/**
+ * Follows a tracked note whose file is missing to wherever it was moved or
+ * renamed by hand, and brings the remote change in there.
+ *
+ * Only an exact id match is followed, and only when exactly one untracked
+ * file claims the id. Two claimants is a copy whose original has since
+ * moved or gone, and which of them is the note can't be told (push refuses
+ * the same case for the same reason); a claimant still carrying conflict
+ * markers can't take a merge. Both fall back to recreating the note at its
+ * tracked path, as before this existed - the claimants are left untouched,
+ * and the warning says what push will make of them.
+ *
+ * Recreating is not the only way out of those two, but it's the one that
+ * can't strand anything. Leaving the note missing and its tag where it was
+ * (as an in-place file with markers does) would leave the move unpushable -
+ * push refuses a move whose tag is stale, and an incremental pull never
+ * delivers this change again - with nothing the user could do about it
+ * short of a fresh clone. A duplicate the warning names is the lesser harm.
+ */
+export async function followLocalMove(
+  targetDir: string,
+  recordName: string,
+  untracked: UntrackedNoteIdIndex,
+  remoteBodyText: string,
+  titles: MovedFileTitles,
+): Promise<LocalMoveOutcome> {
+  const claimants = untracked.claims.get(recordName) ?? [];
+  if (claimants.length > 1) {
+    return {
+      kind: "recreate",
+      warning:
+        `${claimants.length} files carry its ${NOTE_ID_KEY} (${claimants.join(", ")}), so which one it was ` +
+        "moved to can't be told - delete the copies you don't want before pushing, or they go up as new notes",
+    };
+  }
+  const movedFile = claimants[0];
+  if (movedFile === undefined) {
+    // An unreadable file may be where it went; nothing can be merged into
+    // it, but the user should hear why a duplicate may be about to appear.
+    if (untracked.unreadable.length > 0) {
+      return {
+        kind: "recreate",
+        warning:
+          `${untracked.unreadable.join(", ")} couldn't be read to check whether it was moved there - if it was, ` +
+          "make it readable and delete one of the two copies before pushing, or the other goes up as a new note",
+      };
+    }
+    return { kind: "recreate" };
+  }
+  const merged = await mergeRemoteChangeIntoMovedFile(targetDir, recordName, movedFile, remoteBodyText, titles);
+  if (merged.status === "unresolvedMarkers") {
+    return {
+      kind: "recreate",
+      warning:
+        `it was moved locally to ${movedFile}, which still contains diff3 conflict markers, so the remote change ` +
+        "couldn't be merged there - resolve the markers, then delete one of the two copies before pushing, or the " +
+        "other goes up as a new note",
+    };
+  }
+  return { kind: "followed", file: movedFile, status: merged.status };
+}
+
+/**
+ * Brings a remote change into the file a tracked note was moved or renamed
+ * to by hand, in place of the tracked file that's now missing.
+ *
+ * The same base-copy discipline as `mergeRemoteChangeIntoLocalFile`: an
+ * unedited file just takes the remote text, an edited one gets a 3-way
+ * merge, and the base copy only advances to the remote text when nothing is
+ * left to resolve.
+ *
+ * What differs is the envelope, which stays as the user has it - with one
+ * exception. The local move wins, and under filename-as-title a renamed
+ * file *is* a retitle that push sends from the file's name and envelope, so
+ * an `apple-note-title` the user set or changed is left alone. But a key
+ * that still says exactly what the last sync recorded is only the old
+ * remote title, not a choice of theirs, and push reads it ahead of the name.
+ * Left stale, it would send the note's previous title back over the remote
+ * retitle. That key follows the remote title instead,
+ * as it would have in a file that never moved.
+ */
+export async function mergeRemoteChangeIntoMovedFile(
+  targetDir: string,
+  recordName: string,
+  movedFile: string,
+  remoteBodyText: string,
+  { previousTitle, remoteTitle, titleMode = "in-body" }: MovedFileTitles,
+): Promise<{ status: "updated" | "merged" | "conflict" | "unresolvedMarkers" }> {
+  const filePath = path.join(targetDir, movedFile);
+  const split = splitFrontmatter(await readFile(filePath, "utf-8"), {
+    filenameAsTitle: titleMode === "filename",
+  });
+  const { body } = split;
+  const fileTitle = readNoteTitle(split.frontmatter);
+  const frontmatter =
+    fileTitle === undefined || fileTitle !== previousTitle || fileTitle === remoteTitle
+      ? split.frontmatter
+      : remoteTitle === undefined
+        ? clearNoteTitle(split.frontmatter)
+        : setNoteTitle(split.frontmatter, remoteTitle);
+  const base = await readBaseCopy(targetDir, recordName);
+  if (base !== undefined && body === base) {
+    await writeFile(filePath, joinFrontmatter(frontmatter, remoteBodyText), "utf-8");
+    await writeBaseCopy(targetDir, recordName, remoteBodyText);
+    return { status: "updated" };
+  }
+  if (hasConflictMarkers(body)) {
+    return { status: "unresolvedMarkers" };
+  }
+  const outcome = mergeNoteVersions(base ?? "", body, remoteBodyText);
+  await writeFile(filePath, joinFrontmatter(frontmatter, outcome.text), "utf-8");
   if (!outcome.hasConflict) {
     await writeBaseCopy(targetDir, recordName, remoteBodyText);
   }

@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import { planFolderCreates } from "../notes/folderCreate.js";
@@ -32,6 +32,7 @@ import {
 } from "../notes/noteIdFrontmatter.js";
 import { carriedTitleSpelling, representabilityProblem, titleIsRepresentable } from "../notes/titleFilename.js";
 import { resolveNoteIds } from "../notes/noteIdPairing.js";
+import { listUntrackedMarkdownFiles } from "../notes/untrackedFiles.js";
 import { classifyNoteRecord, type NoteDecodeResult } from "../notes/decodeNoteRecord.js";
 import { CorruptStateFileError, NotClonedDirectoryError, NotesUnavailableError } from "../errors.js";
 import { buildNoteCreateFields, buildNoteMoveFields, buildNoteTrashFields, buildNoteUpdateFields } from "../notes/encodeNoteRecord.js";
@@ -289,7 +290,7 @@ export async function buildPushPlan(
      * can't be read - what a move needs to honor a dropped title. */
     noteTitleKey: NoteTitleKey;
   }[] = [];
-  const markdownFiles = await listUntrackedMarkdownFiles(targetDir, state);
+  const markdownFiles = await listUntrackedMarkdownFiles(targetDir, state.notes, state.attachments);
   // `attachments/` is reserved for attachment files, so a note put there is
   // never pushed - but it shouldn't look, from status or push, as though it
   // had been. One notice for all of them: some tools keep markdown there on
@@ -1495,53 +1496,6 @@ export async function runPush(targetDir: string, options: PushOptions = {}): Pro
   await writeCloneState(targetDir, state);
 
   return { dryRun, pushed, entries: results, unchanged, notices };
-}
-
-/** Untracked `.md` files anywhere in the vault, as vault-root-relative
- * POSIX paths - the raw material for the create half, the local-move
- * pairing, and the loose-file/unknown-folder refusals. Skips
- * dot-directories (the state dir, .git) and the reserved per-folder
- * `attachments/` directories; `.md` files found in the latter are returned
- * separately, so the plan can say they're being ignored rather than skip
- * them in silence. A `.md` this clone already tracks - a markdown file
- * attached to a note, or a note that lives under such a path - belongs there
- * and isn't reported. */
-async function listUntrackedMarkdownFiles(
-  targetDir: string,
-  state: CloneState,
-): Promise<{ files: string[]; inAttachmentDirs: string[] }> {
-  const tracked = new Set([
-    ...Object.values(state.notes).map((entry) => entry.file),
-    ...Object.values(state.attachments ?? {}).map((attachment) => attachment.file),
-  ]);
-  const found: string[] = [];
-  const inAttachmentDirs: string[] = [];
-
-  const walk = async (dir: string, inAttachments: boolean): Promise<void> => {
-    let dirents;
-    try {
-      dirents = await readdir(path.join(targetDir, dir), { withFileTypes: true });
-    } catch (cause) {
-      if (isEnoent(cause)) {
-        return;
-      }
-      throw cause;
-    }
-    for (const dirent of dirents) {
-      if (dirent.name.startsWith(".")) {
-        continue;
-      }
-      const relative = dir === "" ? dirent.name : `${dir}/${dirent.name}`;
-      if (dirent.isDirectory()) {
-        await walk(relative, inAttachments || dirent.name.toLowerCase() === "attachments");
-      } else if (dirent.isFile() && dirent.name.endsWith(".md") && !tracked.has(relative)) {
-        (inAttachments ? inAttachmentDirs : found).push(relative);
-      }
-    }
-  };
-
-  await walk("", false);
-  return { files: found.sort(), inAttachmentDirs: inAttachmentDirs.sort() };
 }
 
 /**

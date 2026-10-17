@@ -1,11 +1,17 @@
 import { lstat } from "node:fs/promises";
 import type { BigIntStats } from "node:fs";
 
+/** True if `err` is a Node filesystem error carrying `code` (`ENOENT`,
+ * `EACCES`, ...). */
+export function hasErrnoCode(err: unknown, code: string): boolean {
+  return err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === code;
+}
+
 /** True if `err` is a Node "file not found" error - used by every read path
  * in this project that treats a missing file as "nothing recorded yet"
  * rather than a failure. */
 export function isEnoent(err: unknown): boolean {
-  return err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT";
+  return hasErrnoCode(err, "ENOENT");
 }
 
 /** What is at `filePath` - file, directory, or a symlink itself (dangling or
