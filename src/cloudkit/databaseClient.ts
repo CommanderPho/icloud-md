@@ -1,6 +1,7 @@
 import type { IcloudSession } from "../session.js";
 import { appendDebugLog, loggedFetch } from "../debugLog.js";
 import { CloudKitRequestFailedError, CloudKitSyncTokenStalledError, CloudKitZoneFetchFailedError } from "../errors.js";
+import { isDeletedNote } from "../notes/decodeNoteRecord.js";
 
 export interface CloudKitFieldValue {
   value: unknown;
@@ -127,6 +128,8 @@ const NOTE_DESIRED_KEYS = [
   "MergeableDataEncrypted",
   "IsPinned",
   "TextDataEncrypted",
+  // Where a very large note keeps its text instead - see `inlineAssetBodies`.
+  "TextDataAsset",
 ];
 
 const NOTE_DESIRED_RECORD_TYPES = [
@@ -267,10 +270,13 @@ export async function fetchZoneNoteRecords(
       onPage?.(pageRecords.length);
     }
 
-    return {
-      records: await dedupeWalkRecords(records, `fetchZoneNoteRecords (${database} zone ${zoneID.ownerRecordName ?? "Notes"})`),
-      syncToken,
-    };
+    // Dedupe first, so a record listed twice has its asset downloaded once.
+    const deduped = await dedupeWalkRecords(
+      records,
+      `fetchZoneNoteRecords (${database} zone ${zoneID.ownerRecordName ?? "Notes"})`,
+    );
+    await inlineAssetBodies(deduped, { session, ckDatabaseHost, dsid, database, zoneID });
+    return { records: deduped, syncToken };
   };
 
   if (sinceSyncToken === undefined) {
@@ -531,7 +537,20 @@ export async function lookupRecords(
   zoneID: CloudKitZoneID,
   recordNames: string[],
 ): Promise<CloudKitRecord[]> {
+  return (await lookupRecordsWithMisses(session, ckDatabaseHost, dsid, database, zoneID, recordNames)).records;
+}
+
+/** `lookupRecords`, plus the names the server answered NOT_FOUND for. */
+async function lookupRecordsWithMisses(
+  session: IcloudSession,
+  ckDatabaseHost: string,
+  dsid: string,
+  database: CloudKitDatabase,
+  zoneID: CloudKitZoneID,
+  recordNames: string[],
+): Promise<{ records: CloudKitRecord[]; notFound: Set<string> }> {
   const records: CloudKitRecord[] = [];
+  const notFound = new Set<string>();
   for (let start = 0; start < recordNames.length; start += LOOKUP_BATCH_SIZE) {
     const batch = recordNames.slice(start, start + LOOKUP_BATCH_SIZE);
     const body = await postDatabase(
@@ -552,13 +571,18 @@ export async function lookupRecords(
     // rather than failing the whole lookup; the caller's record keeps whatever
     // the zone listing returned and decides what a still-missing body means
     // (`fetchSharedNoteRecords` treats it as a failed zone fetch).
-    records.push(
-      ...body.records
-        .filter((entry: unknown) => isRecord(entry) && typeof entry.recordType === "string" && isRecord(entry.fields))
-        .map(parseRecord),
-    );
+    for (const entry of body.records as unknown[]) {
+      if (!isRecord(entry)) {
+        continue;
+      }
+      if (typeof entry.recordType === "string" && isRecord(entry.fields)) {
+        records.push(parseRecord(entry));
+      } else if (entry.serverErrorCode === "NOT_FOUND" && typeof entry.recordName === "string") {
+        notFound.add(entry.recordName);
+      }
+    }
   }
-  return records;
+  return { records, notFound };
 }
 
 /** A shared zone whose fetch didn't complete this run, skipped rather than
@@ -584,6 +608,16 @@ export type SkippedSharedZone =
   | { zoneID: CloudKitZoneID; reason: "zone-not-found"; serverErrorCode: string }
   | { zoneID: CloudKitZoneID; reason: "missing-note-bodies"; missingRecordNames: string[] }
   | { zoneID: CloudKitZoneID; reason: "stalled-sync-token" };
+
+/** "3 note(s) (A, B, C)" for a missing-note-bodies skip, naming at most five
+ * records - enough to find the one note that holds a zone back every pull
+ * (with `object show`), without a first pull's failed lookup printing
+ * hundreds. */
+export function describeMissingNotes(recordNames: string[]): string {
+  const shown = recordNames.slice(0, 5).join(", ");
+  const more = recordNames.length > 5 ? `, and ${recordNames.length - 5} more` : "";
+  return `${recordNames.length} note(s) (${shown}${more})`;
+}
 
 export interface SharedNoteRecordsResult {
   zones: SharedZoneChanges[];
@@ -642,6 +676,7 @@ export async function fetchSharedNoteRecords(
           missingBody.map((record) => record.recordName),
         );
         mergeLookedUpRecords(records, lookedUp);
+        await inlineAssetBodies(records, { session, ckDatabaseHost, dsid, database: "shared", zoneID });
       }
 
       // A body still missing after the lookup means this zone's fetch is
@@ -675,8 +710,133 @@ export async function fetchSharedNoteRecords(
   return { zones, skippedZones };
 }
 
+/** Where a zone's records came from - enough to `lookup` one again. */
+interface ZoneSource {
+  session: IcloudSession;
+  ckDatabaseHost: string;
+  dsid: string;
+  database: CloudKitDatabase;
+  zoneID: CloudKitZoneID;
+}
+
+/**
+ * Moves a very large note's text inline, where every reader expects it.
+ * Past some size Apple stores a note's text as a `TextDataAsset` instead of
+ * `TextDataEncrypted`, and the record then carries no `TextDataEncrypted` at
+ * all - so without this the note reads as body-less and is never cloned or
+ * pulled. The asset holds the same bytes the inline field would (a gzipped
+ * NoteStoreProto document, confirmed against a real ~830 KB note, 2026-09-26),
+ * so its download is inlined as-is and decodes on the normal path.
+ *
+ * Only the in-memory record changes. Push re-reads the record before any
+ * write and still refuses a note stored as an asset.
+ *
+ * A download that fails even after a fresh `lookup` (see
+ * `resolveTextAsset`) must not read as a clean sync while the syncToken
+ * moves past the note. In the private zone it throws: there's only the one
+ * zone, so holding it back and failing are the same thing. In a shared zone
+ * the body is left missing, and `fetchSharedNoteRecords`' existing
+ * missing-note-bodies check holds that zone (and its token) back while every
+ * other zone syncs.
+ *
+ * A note that changed after it was listed is taken as it is now: one edited
+ * back under the size limit replaces the listed record with its inline
+ * text, and one gone since (the lookup answers NOT_FOUND) is left without a
+ * body until the next pull lists the deletion. In the private zone it then
+ * reads as missing-body, which never untracks a note; in a shared zone it
+ * holds the zone back one pull, as any body lookup that misses does.
+ */
+async function inlineAssetBodies(records: CloudKitRecord[], source: ZoneSource): Promise<void> {
+  for (let i = 0; i < records.length; i += 1) {
+    const record = records[i];
+    if (!record || !needsBodyLookup(record) || record.fields.TextDataAsset?.value == null) {
+      continue;
+    }
+    try {
+      const resolved = await resolveTextAsset(record, source);
+      if (resolved) {
+        records[i] = resolved;
+      }
+    } catch (error) {
+      if (source.database === "private") {
+        throw error;
+      }
+      await appendDebugLog({
+        note:
+          `inlineAssetBodies: couldn't download the text of shared note ${record.recordName} ` +
+          `(${error instanceof Error ? error.message : String(error)}) - leaving its body missing`,
+      });
+    }
+  }
+}
+
+/**
+ * Returns `record` with its `TextDataAsset` downloaded into
+ * `TextDataEncrypted`, retrying once against a fresh `lookup` of the record
+ * if the first attempt fails. The download URLs expire, and
+ * `inlineAssetBodies` runs only after a zone's whole paged walk, so on a big
+ * clone the listing's URL can already be minutes old. A record with no
+ * usable `downloadURL` takes the same path rather than passing as body-less.
+ *
+ * Once the retry has looked the note up again, the fresh record is the one
+ * returned: as is when it no longer needs a download (its text is inline
+ * again, or it's been deleted), undefined when the lookup says it's gone.
+ */
+async function resolveTextAsset(record: CloudKitRecord, source: ZoneSource): Promise<CloudKitRecord | undefined> {
+  try {
+    return withInlinedText(record, await fetchAssetBytes(textAssetDownloadURL(record)));
+  } catch (firstError) {
+    const { records, notFound } = await lookupRecordsWithMisses(
+      source.session,
+      source.ckDatabaseHost,
+      source.dsid,
+      source.database,
+      source.zoneID,
+      [record.recordName],
+    );
+    const [fresh] = records;
+    if (!fresh) {
+      if (notFound.has(record.recordName)) {
+        await appendDebugLog({
+          note: `inlineAssetBodies: note ${record.recordName} was deleted after it was listed - leaving its body missing`,
+        });
+        return undefined;
+      }
+      throw firstError;
+    }
+    if (!needsBodyLookup(fresh)) {
+      return fresh;
+    }
+    try {
+      return withInlinedText(fresh, await fetchAssetBytes(textAssetDownloadURL(fresh)));
+    } catch (retryError) {
+      const detail = retryError instanceof Error ? retryError.message : String(retryError);
+      throw new CloudKitRequestFailedError(
+        `Couldn't download the text of note ${record.recordName}, which Apple keeps in a separate file: ${detail}`,
+      );
+    }
+  }
+}
+
+function withInlinedText(record: CloudKitRecord, bytes: Buffer): CloudKitRecord {
+  record.fields.TextDataEncrypted = { value: bytes.toString("base64"), type: "ENCRYPTED_BYTES" };
+  return record;
+}
+
+function textAssetDownloadURL(record: CloudKitRecord): string {
+  const asset = record.fields.TextDataAsset?.value;
+  if (!isRecord(asset) || typeof asset.downloadURL !== "string" || asset.downloadURL === "") {
+    throw new CloudKitRequestFailedError(`note ${record.recordName}'s TextDataAsset has no download URL`);
+  }
+  return asset.downloadURL;
+}
+
+/** Whether a record is a live note still missing its text. A note in
+ * Recently Deleted or marked `Deleted` is classified "deleted" whatever its
+ * body, so fetching one - an asset download, or holding back a shared zone
+ * over it - would only cost something. */
 function needsBodyLookup(record: CloudKitRecord): boolean {
-  if (record.recordType !== "Note" || record.deleted === true) {
+  if (record.recordType !== "Note" || isDeletedNote(record)) {
     return false;
   }
   return typeof record.fields.TextDataEncrypted?.value !== "string";

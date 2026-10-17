@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { bindKnownAccount, bindNewFolderAccount } from "../auth/folderAuth.js";
-import { fetchAllNoteRecords, fetchSharedNoteRecords } from "../cloudkit/databaseClient.js";
+import { describeMissingNotes, fetchAllNoteRecords, fetchSharedNoteRecords } from "../cloudkit/databaseClient.js";
 import type { CloudKitRecord, SkippedSharedZone } from "../cloudkit/databaseClient.js";
 import { resolveNoteAttachments, type AttachmentAuth } from "../notes/attachmentSync.js";
 import { classifyNoteRecord } from "../notes/decodeNoteRecord.js";
@@ -259,8 +259,9 @@ function skippedZoneNotice(skipped: SkippedSharedZone): string {
       );
     case "missing-note-bodies":
       return (
-        `Skipped the shared zone owned by ${owner}: ${skipped.missingRecordNames.length} note(s) came through without ` +
-        "their text and looking them up didn't fill it in - no notes from it were cloned; the first pull will retry it"
+        `Skipped the shared zone owned by ${owner}: ${describeMissingNotes(skipped.missingRecordNames)} came through ` +
+        "without their text and looking them up didn't fill it in - no notes from it were cloned; the first pull will " +
+        "retry it"
       );
     case "stalled-sync-token":
       return (

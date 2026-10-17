@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { resolveFolderAccount } from "../auth/folderAuth.js";
 import {
+  describeMissingNotes,
   fetchAllNoteRecords,
   fetchSharedNoteRecords,
   lookupRecords,
@@ -1030,9 +1031,9 @@ function skippedZoneNotice(skipped: SkippedSharedZone, owner: string | undefined
       );
     case "missing-note-bodies":
       return (
-        `Skipped the shared zone owned by ${owner ?? "unknown"} this run: ${skipped.missingRecordNames.length} ` +
-        "note(s) came through without their text and looking them up didn't fill it in - nothing from that zone " +
-        "was touched, and the next pull will retry it"
+        `Skipped the shared zone owned by ${owner ?? "unknown"} this run: ` +
+        `${describeMissingNotes(skipped.missingRecordNames)} came through without their text and looking them up ` +
+        "didn't fill it in - nothing from that zone was touched, and the next pull will retry it"
       );
     case "stalled-sync-token":
       return (
