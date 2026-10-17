@@ -10,12 +10,24 @@ import { groupNoteIdClaims, type UntrackedFile } from "./noteIdPairing.js";
  * POSIX paths - the raw material for push's create half, the local-move
  * pairing, and the loose-file/unknown-folder refusals, and for pull finding
  * where a note moved by hand went. Skips dot-directories (the state dir,
- * .git) and the reserved per-folder `attachments/` directories. */
-export async function listUntrackedMarkdownFiles(targetDir: string, notes: CloneState["notes"]): Promise<string[]> {
-  const tracked = new Set(Object.values(notes).map((entry) => entry.file));
+ * .git) and the reserved per-folder `attachments/` directories; `.md` files
+ * found in the latter are returned separately, so push's plan can say
+ * they're being ignored rather than skip them in silence. A `.md` this clone
+ * already tracks - a markdown file attached to a note, or a note that lives
+ * under such a path - belongs there and isn't reported. */
+export async function listUntrackedMarkdownFiles(
+  targetDir: string,
+  notes: CloneState["notes"],
+  attachments: CloneState["attachments"] = undefined,
+): Promise<{ files: string[]; inAttachmentDirs: string[] }> {
+  const tracked = new Set([
+    ...Object.values(notes).map((entry) => entry.file),
+    ...Object.values(attachments ?? {}).map((attachment) => attachment.file),
+  ]);
   const found: string[] = [];
+  const inAttachmentDirs: string[] = [];
 
-  const walk = async (dir: string): Promise<void> => {
+  const walk = async (dir: string, inAttachments: boolean): Promise<void> => {
     let dirents;
     try {
       dirents = await readdir(path.join(targetDir, dir), { withFileTypes: true });
@@ -31,17 +43,15 @@ export async function listUntrackedMarkdownFiles(targetDir: string, notes: Clone
       }
       const relative = dir === "" ? dirent.name : `${dir}/${dirent.name}`;
       if (dirent.isDirectory()) {
-        if (dirent.name.toLowerCase() !== "attachments") {
-          await walk(relative);
-        }
+        await walk(relative, inAttachments || dirent.name.toLowerCase() === "attachments");
       } else if (dirent.isFile() && dirent.name.endsWith(".md") && !tracked.has(relative)) {
-        found.push(relative);
+        (inAttachments ? inAttachmentDirs : found).push(relative);
       }
     }
   };
 
-  await walk("");
-  return found.sort();
+  await walk("", false);
+  return { files: found.sort(), inAttachmentDirs: inAttachmentDirs.sort() };
 }
 
 /** Untracked files by the `apple-note-id` they carry, plus the ones that
@@ -73,7 +83,7 @@ export async function indexUntrackedNoteIds(
 ): Promise<UntrackedNoteIdIndex> {
   const untracked: UntrackedFile[] = [];
   const unreadable: string[] = [];
-  for (const file of await listUntrackedMarkdownFiles(targetDir, notes)) {
+  for (const file of (await listUntrackedMarkdownFiles(targetDir, notes)).files) {
     let raw: string;
     try {
       raw = await readFile(path.join(targetDir, file), "utf-8");
