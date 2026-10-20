@@ -23,3 +23,7 @@ dist/
 # out of the public repo - it carries the device UDID, plus real note
 # content and screenshots under forensics/ and shots/.
 /harness/
+
+## Notes:
+/my-notes/
+my-notes/
