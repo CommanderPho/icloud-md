@@ -137,6 +137,14 @@ is skipped rather than aborting the clone: `.icloud-md/state.json` is still
 written for everything that landed, and the skipped identities are listed
 at the end and in `~/.config/icloud-md/debug.log`.
 
+A clone that is interrupted, or that hits an attachment iCloud won't serve,
+is not a vault yet (no `.icloud-md/state.json`). Re-run `icloud-md clone`
+against the **same** directory: already-downloaded attachment files are
+reused, and an attachment that still fails to download is left as an
+`<apple-embed>` marker so the rest of the export can finish. Name the
+account (`--account you@example.com`) to skip the sign-in window on that
+retry.
+
 If you keep your notes in Obsidian, read [Using Obsidian?](#using-obsidian)
 before you clone — the vault shape is chosen once, at `clone` time.
 

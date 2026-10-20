@@ -427,6 +427,7 @@ export async function runPull(
           }
           Object.assign(attachments, resolved.attachments);
           summary.attachmentsDownloaded += Object.keys(resolved.attachments).length;
+          summary.notices.push(...resolved.notices);
           for (const stale of resolved.staleTableAttachmentRecordNames) {
             delete tableAttachments[stale];
           }

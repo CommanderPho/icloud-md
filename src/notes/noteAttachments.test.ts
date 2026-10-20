@@ -158,7 +158,11 @@ test("parseAssetField extracts downloadURL and fileChecksum from an ASSETID fiel
     value: { downloadURL: "https://cvws.icloud-content.com/x", fileChecksum: "abc123", size: 42 },
     type: "ASSETID",
   };
-  assert.deepEqual(parseAssetField(field), { downloadURL: "https://cvws.icloud-content.com/x", fileChecksum: "abc123" });
+  assert.deepEqual(parseAssetField(field), {
+    downloadURL: "https://cvws.icloud-content.com/x",
+    fileChecksum: "abc123",
+    size: 42,
+  });
 });
 
 test("parseAssetField returns undefined for non-ASSETID or malformed fields", () => {
@@ -166,6 +170,18 @@ test("parseAssetField returns undefined for non-ASSETID or malformed fields", ()
   assert.equal(parseAssetField({ value: "not an object", type: "ASSETID" }), undefined);
   assert.equal(parseAssetField({ value: { downloadURL: "x" }, type: "ASSETID" }), undefined);
   assert.equal(parseAssetField({ value: { downloadURL: "x", fileChecksum: "y" }, type: "STRING" }), undefined);
+});
+
+test("parseAssetField omits size when the Asset field didn't send one", () => {
+  const field = {
+    value: { downloadURL: "https://cvws.icloud-content.com/x", fileChecksum: "abc123" },
+    type: "ASSETID",
+  };
+  assert.deepEqual(parseAssetField(field), {
+    downloadURL: "https://cvws.icloud-content.com/x",
+    fileChecksum: "abc123",
+    size: undefined,
+  });
 });
 
 test("isTableUti recognizes the table UTI and rejects file UTIs", () => {

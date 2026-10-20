@@ -8,8 +8,9 @@ import {
   type CloudKitZoneID,
 } from "../cloudkit/databaseClient.js";
 import { appendDebugLog } from "../debugLog.js";
-import { isEnoent } from "../fsUtil.js";
+import { isEnoent, lstatIfPresent } from "../fsUtil.js";
 import type { IcloudSession } from "../session.js";
+import type { SyncNotice } from "../progress.js";
 import type { CloneStateAttachmentEntry, CloneStateTableAttachmentEntry } from "./cloneState.js";
 import { decodeTableMarkdown } from "./decodeTableRecord.js";
 import { sanitizeAttachmentFileName, uniqueFileName } from "./filename.js";
@@ -46,6 +47,9 @@ export interface MatchedAttachment {
   linkPath: string;
   needsDownload: boolean;
   downloadURL: string;
+  /** Asset `size` when the Media record sent one - used to skip a re-download
+   * if that many bytes are already at `relativeFile`. */
+  size: number | undefined;
   entry: CloneStateAttachmentEntry;
 }
 
@@ -133,6 +137,7 @@ export function matchAttachmentRecords(
       linkPath: path.posix.relative(noteDir, relativeFile),
       needsDownload: !existing || existing.mediaFileChecksum !== asset.fileChecksum,
       downloadURL: asset.downloadURL,
+      size: asset.size,
       entry: { file: relativeFile, mediaRecordName, mediaFileChecksum: asset.fileChecksum, noteRecordName },
     });
   }
@@ -171,6 +176,9 @@ export interface AttachmentSyncResult {
   /** One entry per table reference that resolved this call - the caller
    * (`pull`) feeds these into `versionHistory.ts`'s `recordVersion`. */
   tableAttachmentSnapshots: TableAttachmentSnapshotSource[];
+  /** Download failures that were degraded to an embed marker rather than
+   * aborting the note - the caller surfaces these in its summary. */
+  notices: SyncNotice[];
 }
 
 /**
@@ -185,16 +193,17 @@ export interface AttachmentSyncResult {
  *
  * Per the Safety Guarantee Audit, a reference that doesn't match what we've
  * verified live - a file reference whose `Attachment`/`Media`/`Asset` chain
- * doesn't resolve, a table whose `MergeableDataEncrypted` doesn't decode, or
- * a placeholder with no usable `attachmentInfo` at all (an `unknown` slot) -
- * doesn't refuse the whole note. That one placeholder gets an inline embed
- * marker (see `formatEmbedMarker`) carrying whatever identity it has, and
- * the rest of the note still comes through. Since Step 1 of the formatting
- * plan (2026-07-17) a marker no longer makes the note unpublishable either -
- * `push` verifies markers survive verbatim instead. The actual matching
- * (`extractMediaRecordNames`/`matchAttachmentRecords`, `decodeTableMarkdown`)
- * is pure and unit-tested against real captures; this function is the thin
- * network+fs wrapper around it, verified live instead.
+ * doesn't resolve, a table whose `MergeableDataEncrypted` doesn't decode, a
+ * placeholder with no usable `attachmentInfo` at all (an `unknown` slot), or
+ * a file whose signed download URL fails even after re-looking-up a fresh
+ * one - doesn't refuse the whole note. That one placeholder gets an inline
+ * embed marker (see `formatEmbedMarker`) carrying whatever identity it has,
+ * and the rest of the note still comes through. Since Step 1 of the
+ * formatting plan (2026-07-17) a marker no longer makes the note
+ * unpublishable either - `push` verifies markers survive verbatim instead.
+ * The actual matching (`extractMediaRecordNames`/`matchAttachmentRecords`,
+ * `decodeTableMarkdown`) is pure and unit-tested against real captures; this
+ * function is the thin network+fs wrapper around it, verified live instead.
  */
 export async function resolveNoteAttachments(
   auth: AttachmentAuth,
@@ -224,6 +233,7 @@ export async function resolveNoteAttachments(
       tableAttachments: {},
       staleTableAttachmentRecordNames: previousTableForNote,
       tableAttachmentSnapshots: [],
+      notices: [],
     };
   }
 
@@ -284,6 +294,7 @@ export async function resolveNoteAttachments(
   }
 
   const attachments: Record<string, CloneStateAttachmentEntry> = {};
+  const notices: SyncNotice[] = [];
   if (fileRefs.length > 0) {
     const mediaRecordNames = extractMediaRecordNames(fileRefs, attachmentRecords);
     const knownMediaRecordNames = mediaRecordNames.filter((name): name is string => name !== undefined);
@@ -346,6 +357,7 @@ export async function resolveNoteAttachments(
     tableAttachments,
     staleTableAttachmentRecordNames,
     tableAttachmentSnapshots,
+    notices,
   };
 }
 

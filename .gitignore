@@ -24,7 +24,10 @@ dist/
 # content and screenshots under forensics/ and shots/.
 /harness/
 
+.env
+
 ## Notes:
 /my-notes/
 my-notes/
 lolinternets-icloud-notes/
+lolinternets-icloud/

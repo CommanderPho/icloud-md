@@ -194,7 +194,11 @@ export async function runClone(
             usedNamesFor(usedAttachmentFileNames, placement.dir),
             placement.dir,
           );
-          bodyText = resolvedAttachments.bodyText;
+          bodyText = resolved.bodyText;
+          Object.assign(attachments, resolved.attachments);
+          summary.attachmentsDownloaded += Object.keys(resolved.attachments).length;
+          Object.assign(tableAttachments, resolved.tableAttachments);
+          summary.notices.push(...resolved.notices);
         }
 
         const usedInDir = usedNamesFor(usedFileNames, placement.dir);

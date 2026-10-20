@@ -233,6 +233,10 @@ function extensionForUti(typeUti: string): string {
 export interface AttachmentAsset {
   downloadURL: string;
   fileChecksum: string;
+  /** Byte length from the Asset field, when the server sent it - used to
+   * reuse an already-downloaded file (a failed clone's leftovers) without
+   * re-fetching. Absent when the field had no `size`. */
+  size?: number | undefined;
 }
 
 /** Extracts the download URL + checksum out of an ASSETID-typed field
@@ -246,5 +250,9 @@ export function parseAssetField(field: CloudKitFieldValue | undefined): Attachme
   if (typeof value.downloadURL !== "string" || typeof value.fileChecksum !== "string") {
     return undefined;
   }
-  return { downloadURL: value.downloadURL, fileChecksum: value.fileChecksum };
+  return {
+    downloadURL: value.downloadURL,
+    fileChecksum: value.fileChecksum,
+    size: typeof value.size === "number" && Number.isFinite(value.size) ? value.size : undefined,
+  };
 }

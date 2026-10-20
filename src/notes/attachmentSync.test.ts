@@ -212,6 +212,7 @@ test("matchAttachmentRecords resolves a new audio attachment's filename and down
       linkPath: "attachments/Call with Janice Elkins.m4a",
       needsDownload: true,
       downloadURL: "https://cvws.icloud-content.com/B/audio-asset",
+      size: 51432744,
       entry: {
         file: "attachments/Call with Janice Elkins.m4a",
         mediaRecordName: "0B8509A3-A5FC-470B-A777-03BFFFDFB5F9",
@@ -238,6 +239,7 @@ test("matchAttachmentRecords resolves a new image attachment's filename and down
   );
   assert.equal(matched?.[0]?.relativeFile, "attachments/_7130093.jpeg");
   assert.equal(matched?.[0]?.needsDownload, true);
+  assert.equal(matched?.[0]?.size, 2908682);
   assert.equal(matched?.[0]?.entry.mediaFileChecksum, "ARKf/Vy+irL9d80LorfL6M0D7FG5");
 });
 
