@@ -4,19 +4,19 @@ overview: After a successful sign-in and fetch, clone should keep going when a s
 todos:
   - id: clone-catch
     content: Catch per-note errors in runClone after fetch, skipFailed + notices + debug.log (recordName, intended path, error), always writeCloneState; merge attachment state only after a successful note write
-    status: pending
+    status: completed
   - id: attachment-catch
     content: Isolate fetchAssetBytes failures in resolveNoteAttachments (marker + debug log, rest of note continues)
-    status: pending
+    status: completed
   - id: cli-summary
     content: Stop the progress bar before reporting; print skippedFailed notices and a debug.log pointer after processing completes
-    status: pending
+    status: completed
   - id: tests
     content: Unit-test skipFailedCloneRecord and tryDownloadAttachmentBytes against temp debug logs
-    status: pending
+    status: completed
   - id: docs
     content: Document that a post-auth clone skip-and-continues, still writes state.json, and traces skipped items in debug.log
-    status: pending
+    status: completed
 isProject: false
 ---
 

@@ -25,6 +25,7 @@ import { renderRevertResult, runRevert } from "./commands/revert.js";
 import { runStatus } from "./commands/status.js";
 import { createOutputContext, emitError, emitResult, emitUsageError, makeStatusSink, type OutputContext } from "./cli/output.js";
 import { renderPullReport } from "./cli/pullReport.js";
+import { DEFAULT_DEBUG_LOG_PATH } from "./debugLog.js";
 import { NotClonedDirectoryError } from "./errors.js";
 import { recordLastError } from "./lastError.js";
 import { readCloneState } from "./notes/cloneState.js";
@@ -131,7 +132,12 @@ function printCloneSummary(targetDir: string, summary: CloneSummary): void {
       `${summary.writtenUnpublishable} note(s) written with content this tool couldn't fully parse - read-only`,
     );
   }
-  console.log(`Skipped: ${summary.skippedDeleted} deleted, ${summary.skippedUndecodable} undecodable`);
+  console.log(
+    `Skipped: ${summary.skippedDeleted} deleted, ${summary.skippedUndecodable} undecodable, ${summary.skippedFailed} failed`,
+  );
+  if (summary.skippedFailed > 0) {
+    console.log(`Details of skipped notes are in ${DEFAULT_DEBUG_LOG_PATH}`);
+  }
   for (const notice of summary.notices) {
     (notice.level === "warn" ? console.warn : console.log)(notice.message);
   }

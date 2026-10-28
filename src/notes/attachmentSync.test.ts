@@ -4,12 +4,14 @@ import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { CloudKitRecord } from "../cloudkit/databaseClient.js";
+import { readDebugLogSince } from "../debugLog.js";
 import {
   decodeTableAttachment,
   extractMediaRecordNames,
   matchAttachmentRecords,
   removeAttachmentsForNote,
   removeTableAttachmentsForNote,
+  tryDownloadAttachmentBytes,
 } from "./attachmentSync.js";
 import type { CloneStateAttachmentEntry, CloneStateTableAttachmentEntry } from "./cloneState.js";
 import type { AttachmentReference } from "./noteAttachments.js";
@@ -382,3 +384,35 @@ test("decodeTableAttachment refuses malformed MergeableDataEncrypted rather than
   };
   assert.equal(decodeTableAttachment(broken), undefined);
 });
+
+test("tryDownloadAttachmentBytes returns the downloaded bytes on success", async () => {
+  const bytes = Buffer.from("hello");
+  const result = await tryDownloadAttachmentBytes(
+    "https://example.test/asset",
+    { noteRecordName: "NOTE1", attachmentRecordName: "ATT1" },
+    { fetchBytes: async () => bytes },
+  );
+  assert.equal(result, bytes);
+});
+
+test("tryDownloadAttachmentBytes logs and returns undefined when the download throws", () =>
+  withTempDir(async (dir) => {
+    const logPath = path.join(dir, "debug.log");
+    const result = await tryDownloadAttachmentBytes(
+      "https://example.test/asset",
+      { noteRecordName: "NOTE1", attachmentRecordName: "ATT1" },
+      {
+        debugLogPath: logPath,
+        fetchBytes: async () => {
+          throw new Error("Attachment download failed: HTTP 400");
+        },
+      },
+    );
+    assert.equal(result, undefined);
+    const records = await readDebugLogSince(new Date(0), logPath);
+    assert.equal(records.length, 1);
+    assert.match(
+      records[0]?.note ?? "",
+      /resolveNoteAttachments: couldn't download attachment ATT1 for note NOTE1: Attachment download failed: HTTP 400/,
+    );
+  }));

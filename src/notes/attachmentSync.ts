@@ -7,6 +7,7 @@ import {
   type CloudKitRecord,
   type CloudKitZoneID,
 } from "../cloudkit/databaseClient.js";
+import { appendDebugLog } from "../debugLog.js";
 import { isEnoent } from "../fsUtil.js";
 import type { IcloudSession } from "../session.js";
 import type { CloneStateAttachmentEntry, CloneStateTableAttachmentEntry } from "./cloneState.js";
@@ -315,7 +316,14 @@ export async function resolveNoteAttachments(
         continue;
       }
       if (attachment.needsDownload) {
-        const bytes = await fetchAssetBytes(attachment.downloadURL);
+        const bytes = await tryDownloadAttachmentBytes(attachment.downloadURL, {
+          noteRecordName,
+          attachmentRecordName: attachment.recordName,
+        });
+        if (bytes === undefined) {
+          replacements[index] = formatEmbedMarker(ref);
+          continue;
+        }
         await mkdir(path.dirname(path.join(targetDir, attachment.relativeFile)), { recursive: true });
         await writeFile(path.join(targetDir, attachment.relativeFile), bytes);
       }
@@ -337,6 +345,37 @@ export async function resolveNoteAttachments(
     staleTableAttachmentRecordNames,
     tableAttachmentSnapshots,
   };
+}
+
+/**
+ * Downloads one attachment's bytes, or returns `undefined` (after logging)
+ * when the CDN GET fails. A matched attachment whose download then 400s
+ * used to abort the whole clone; the caller degrades that one embed to a
+ * marker the same way an unresolved Media chain already does.
+ */
+export async function tryDownloadAttachmentBytes(
+  downloadURL: string,
+  context: { noteRecordName: string; attachmentRecordName: string },
+  options: {
+    debugLogPath?: string;
+    fetchBytes?: (url: string) => Promise<Buffer>;
+  } = {},
+): Promise<Buffer | undefined> {
+  const fetchBytes = options.fetchBytes ?? fetchAssetBytes;
+  try {
+    return await fetchBytes(downloadURL);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await appendDebugLog(
+      {
+        note:
+          `resolveNoteAttachments: couldn't download attachment ${context.attachmentRecordName} ` +
+          `for note ${context.noteRecordName}: ${message}`,
+      },
+      options.debugLogPath,
+    );
+    return undefined;
+  }
 }
 
 /** Decodes a table reference's `MergeableDataEncrypted` payload into

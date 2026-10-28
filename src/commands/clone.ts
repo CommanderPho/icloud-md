@@ -3,7 +3,8 @@ import path from "node:path";
 import { bindKnownAccount, bindNewFolderAccount } from "../auth/folderAuth.js";
 import { describeMissingNotes, fetchAllNoteRecords, fetchSharedNoteRecords } from "../cloudkit/databaseClient.js";
 import type { CloudKitRecord, SkippedSharedZone } from "../cloudkit/databaseClient.js";
-import { resolveNoteAttachments, type AttachmentAuth } from "../notes/attachmentSync.js";
+import { appendDebugLog } from "../debugLog.js";
+import { resolveNoteAttachments, type AttachmentAuth, type AttachmentSyncResult } from "../notes/attachmentSync.js";
 import { classifyNoteRecord } from "../notes/decodeNoteRecord.js";
 import { noteFileNameFor, titleNeedingFrontmatter, uniqueFileName } from "../notes/filename.js";
 import { buildVaultLayout, placeNote, type SharedZoneRecords } from "../notes/folderLayout.js";
@@ -40,6 +41,12 @@ export interface CloneOptions {
    * still tried, and is what makes an unattended `--account` clone work.
    */
   nonInteractive?: boolean;
+  /**
+   * Where to write skip/failure debug-log lines. Tests pass a temp file so
+   * they don't touch the machine-wide `~/.config/icloud-md/debug.log`.
+   * Production clone leaves this unset and uses the default path.
+   */
+  debugLogPath?: string | undefined;
 }
 
 export interface CloneSummary {
@@ -49,6 +56,7 @@ export interface CloneSummary {
   attachmentsDownloaded: number;
   skippedDeleted: number;
   skippedUndecodable: number;
+  skippedFailed: number;
   notices: SyncNotice[];
 }
 
@@ -110,6 +118,7 @@ export async function runClone(
     attachmentsDownloaded: 0,
     skippedDeleted: 0,
     skippedUndecodable: 0,
+    skippedFailed: 0,
     notices: [],
   };
   for (const skipped of skippedZones) {
@@ -147,6 +156,7 @@ export async function runClone(
 
   for (const source of sources) {
     for (const record of source.records) {
+      let relativeFile: string | undefined;
       try {
         if (record.recordType !== "Note") {
           continue;
@@ -166,11 +176,12 @@ export async function runClone(
 
         let bodyText = decoded.markdownText;
         const unpublishableReason = decoded.unpublishableReason;
+        let resolvedAttachments: AttachmentSyncResult | undefined;
         if (decoded.embedSlots.length > 0) {
           const zoneID = source.sharedZoneOwner
             ? { zoneName: PRIVATE_NOTES_ZONE.zoneName, ownerRecordName: source.sharedZoneOwner }
             : PRIVATE_NOTES_ZONE;
-          const resolved = await resolveNoteAttachments(
+          resolvedAttachments = await resolveNoteAttachments(
             attachmentAuth,
             source.sharedZoneOwner ? "shared" : "private",
             zoneID,
@@ -183,16 +194,13 @@ export async function runClone(
             usedNamesFor(usedAttachmentFileNames, placement.dir),
             placement.dir,
           );
-          bodyText = resolved.bodyText;
-          Object.assign(attachments, resolved.attachments);
-          summary.attachmentsDownloaded += Object.keys(resolved.attachments).length;
-          Object.assign(tableAttachments, resolved.tableAttachments);
+          bodyText = resolvedAttachments.bodyText;
         }
 
         const usedInDir = usedNamesFor(usedFileNames, placement.dir);
         const fileName = uniqueFileName(noteFileNameFor(decoded.titleLine, titleMode), usedInDir);
         usedInDir.add(fileName);
-        const relativeFile = path.posix.join(placement.dir, fileName);
+        relativeFile = path.posix.join(placement.dir, fileName);
 
         const filePath = path.join(targetDir, relativeFile);
         // The rare title a file name can't hold is recorded in
@@ -205,6 +213,13 @@ export async function runClone(
         );
         await applyNoteFileTimes(filePath, record);
         await writeBaseCopy(targetDir, record.recordName, bodyText);
+        // Only merge attachment state after the note itself is on disk, so a
+        // failed write doesn't leave tracked attachments for an untracked note.
+        if (resolvedAttachments !== undefined) {
+          Object.assign(attachments, resolvedAttachments.attachments);
+          summary.attachmentsDownloaded += Object.keys(resolvedAttachments.attachments).length;
+          Object.assign(tableAttachments, resolvedAttachments.tableAttachments);
+        }
         if (source.sharedZoneOwner) {
           summary.writtenShared += 1;
         } else {
@@ -225,6 +240,14 @@ export async function runClone(
           folderRecordName: placement.folderRecordName,
           frontmatterTitle: recordedTitle,
         };
+      } catch (error) {
+        if (record.recordType !== "Note") {
+          throw error;
+        }
+        await skipFailedCloneRecord(summary, record.recordName, error, {
+          ...(relativeFile !== undefined ? { relativeFile } : {}),
+          ...(options.debugLogPath !== undefined ? { debugLogPath: options.debugLogPath } : {}),
+        });
       } finally {
         progress?.onRecordProcessed?.();
       }
@@ -246,6 +269,34 @@ export async function runClone(
   });
 
   return summary;
+}
+
+/**
+ * Records one note that threw while being materialized, so the rest of the
+ * clone (including `writeCloneState`) still runs. Notices are collected
+ * rather than printed here - the CLI stops the progress bar first, then
+ * prints them, so they don't glue themselves to the bar the way a thrown
+ * error used to.
+ */
+export async function skipFailedCloneRecord(
+  summary: CloneSummary,
+  recordName: string,
+  error: unknown,
+  options: { relativeFile?: string; debugLogPath?: string } = {},
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  const pathPart = options.relativeFile !== undefined ? ` (${options.relativeFile})` : "";
+  summary.skippedFailed += 1;
+  summary.notices.push({
+    level: "warn",
+    message: `Skipped note ${recordName}${pathPart}: ${message}`,
+  });
+  const stackPart = stack !== undefined ? `\n${stack}` : "";
+  await appendDebugLog(
+    { note: `clone: skipped note ${recordName}${pathPart}: ${message}${stackPart}` },
+    options.debugLogPath,
+  );
 }
 
 /** The warning a clone prints for a shared zone `fetchSharedNoteRecords` skipped. */

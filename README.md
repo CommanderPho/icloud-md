@@ -132,7 +132,10 @@ closing it yourself aborts the clone. This walks your whole Notes zone
 `./my-notes`, mirroring your Apple Notes folder structure — each note lands
 in the same (sub)folder it's in inside Notes.app, with each sharer's notes
 under a top-level directory named for them — and downloading any
-attachments alongside their note.
+attachments alongside their note. A note or attachment that fails to write
+is skipped rather than aborting the clone: `.icloud-md/state.json` is still
+written for everything that landed, and the skipped identities are listed
+at the end and in `~/.config/icloud-md/debug.log`.
 
 If you keep your notes in Obsidian, read [Using Obsidian?](#using-obsidian)
 before you clone — the vault shape is chosen once, at `clone` time.
@@ -233,7 +236,7 @@ freely; they stay on your machine and never look like a note change.
 
 | Command | What it does |
 | --- | --- |
-| `clone <directory> [--filename-as-title] [--account <appleId>] [--non-interactive]` | Full initial export into a fresh directory: every note, attachments included. Signs in via a browser window the first time a directory (or Apple ID) is used. Refuses to run against an already-cloned directory — use `pull` there instead. `--filename-as-title` picks the Obsidian-shaped layout for the vault; it can only be chosen here. `--account` clones as an Apple ID already signed in on this machine, reusing its saved sign-in instead of asking. `--non-interactive` never opens a sign-in window, failing instead — for unattended runs, where a window has nobody to complete it. |
+| `clone <directory> [--filename-as-title] [--account <appleId>] [--non-interactive]` | Full initial export into a fresh directory: every note, attachments included. Signs in via a browser window the first time a directory (or Apple ID) is used. Refuses to run against an already-cloned directory — use `pull` there instead. `--filename-as-title` picks the Obsidian-shaped layout for the vault; it can only be chosen here. `--account` clones as an Apple ID already signed in on this machine, reusing its saved sign-in instead of asking. `--non-interactive` never opens a sign-in window, failing instead — for unattended runs, where a window has nobody to complete it. After sign-in, a note or attachment that fails to write is skipped (listed in the summary and `~/.config/icloud-md/debug.log`) and the rest of the clone still writes `state.json`. |
 | `pull [directory] [--defer-renames]` | Fetch everything that changed remotely since the last sync; auto-merges non-overlapping local edits, writes conflict markers for overlapping ones. Defaults to the current directory. `--defer-renames` is for editor integrations in a filename-as-title vault — see [Where the title lives](#where-the-title-lives). |
 | `push [directory] [--dry-run]` | Reconcile local disk state up to iCloud: creates notes for new `.md` files, uploads edited notes, moves notes whose file was deleted locally to Recently Deleted, and merges in remote changes to anything edited on both sides. Refuses anything ambiguous rather than guessing. |
 | `status [directory]` | Preview exactly what the next `push` would do — creates, edits, deletes, and any refusals — without writing anything. Runs the same live checks `push --dry-run` does, so it needs to sign in. |
