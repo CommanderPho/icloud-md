@@ -1,17 +1,17 @@
 {
   "name": "icloud-md",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "module",
   "description": "Your iCloud notes as real Markdown files, on any OS, bidirectionally synced with a git-flavored CLI",
   "license": "MIT",
   "author": "Adam Coddington",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/coddingtonbear/icloud-md.git"
+    "url": "git+https://github.com/CommanderPho/icloud-md.git"
   },
-  "homepage": "https://github.com/coddingtonbear/icloud-md#readme",
+  "homepage": "https://github.com/CommanderPho/icloud-md#readme",
   "bugs": {
-    "url": "https://github.com/coddingtonbear/icloud-md/issues"
+    "url": "https://github.com/CommanderPho/icloud-md/issues"
   },
   "keywords": [
     "apple-notes",

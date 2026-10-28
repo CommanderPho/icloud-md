@@ -12,7 +12,7 @@ import { isEnoent } from "../fsUtil.js";
 import type { IcloudSession } from "../session.js";
 import type { CloneStateAttachmentEntry, CloneStateTableAttachmentEntry } from "./cloneState.js";
 import { decodeTableMarkdown } from "./decodeTableRecord.js";
-import { uniqueFileName } from "./filename.js";
+import { sanitizeAttachmentFileName, uniqueFileName } from "./filename.js";
 import {
   decodeAttachmentFilename,
   formatAttachmentMarkdown,
@@ -116,7 +116,9 @@ export function matchAttachmentRecords(
     const fileName = existing
       ? path.basename(existing.file)
       : uniqueFileName(
-          decodeAttachmentFilename(mediaRecord.fields.FilenameEncrypted, ref.attachmentIdentifier, ref.typeUti),
+          sanitizeAttachmentFileName(
+            decodeAttachmentFilename(mediaRecord.fields.FilenameEncrypted, ref.attachmentIdentifier, ref.typeUti),
+          ),
           usedAttachmentFileNames,
         );
     usedAttachmentFileNames.add(fileName);

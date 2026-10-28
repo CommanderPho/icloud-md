@@ -64,6 +64,19 @@ test("sanitizeFolderDirName falls back for unusable titles", () => {
   assert.equal(sanitizeFolderDirName("///"), "Untitled Folder");
 });
 
+test("sanitizeFolderDirName on Windows drops supplementary-plane emoji", () => {
+  assert.equal(
+    sanitizeFolderDirName("📚🖥Kayla's Old rMBP Pro ►Info (Retina, 13-inch, Early 2015)", { windows: true }),
+    "Kayla's Old rMBP Pro ►Info (Retina, 13-inch, Early 2015)",
+  );
+  assert.equal(sanitizeFolderDirName("👨‍👩‍👧‍👦", { windows: true }), "Untitled Folder");
+  assert.equal(sanitizeFolderDirName("☕ Café", { windows: true }), "☕ Café");
+});
+
+test("sanitizeFolderDirName on POSIX keeps supplementary-plane emoji", () => {
+  assert.equal(sanitizeFolderDirName("📚 Recipes", { windows: false }), "📚 Recipes");
+});
+
 function tree(folders: FolderInfo[], preferred?: ReadonlyMap<string, string>) {
   return buildFolderTree(folders, preferred);
 }

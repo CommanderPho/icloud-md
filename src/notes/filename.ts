@@ -1,6 +1,22 @@
 import path from "node:path";
 import { lstatIfPresent } from "../fsUtil.js";
-import { carriedTitleSpelling, encodeTitleStem, titleIsRepresentable } from "./titleFilename.js";
+import {
+  carriedTitleSpelling,
+  dropNonBmpAndJoiners,
+  encodeTitleStem,
+  hasNonBmpCodePoint,
+  titleIsRepresentable,
+  type TitlePlatformOptions,
+} from "./titleFilename.js";
+
+export interface PathSanitizeOptions extends TitlePlatformOptions {
+  /** Maximum code points in the stem. Note names and folder names use 80. */
+  maxLength?: number;
+  /** Folders (and attachment stems) strip a trailing `.` or space, which
+   * Windows rejects and which is confusing anywhere. Note names keep a
+   * trailing dot so `foo.` stays `foo..md` rather than colliding with `foo`. */
+  stripTrailingDotSpace?: boolean;
+}
 
 /**
  * The file name for a note, given how this vault carries titles.
@@ -11,27 +27,49 @@ import { carriedTitleSpelling, encodeTitleStem, titleIsRepresentable } from "./t
  * the only place the title lives - reversible up to trailing whitespace,
  * which the name drops (see `carriedTitleSpelling`) - and falls back to
  * "Untitled" for a title a name genuinely can't carry, with the real one
- * recorded in `apple-note-title` frontmatter by the caller.
+ * recorded in `apple-note-title` frontmatter by the caller. On Windows a
+ * title whose only problem is supplementary-plane emoji gets a BMP-stripped
+ * stem instead of "Untitled.md", still with frontmatter holding the real
+ * title, because Node 20.4-20.11 cannot open those paths.
  */
-export function noteFileNameFor(titleLine: string, titleMode: "in-body" | "filename"): string {
+export function noteFileNameFor(
+  titleLine: string,
+  titleMode: "in-body" | "filename",
+  options?: TitlePlatformOptions,
+): string {
   if (titleMode !== "filename") {
-    return noteFileName(titleLine);
+    return noteFileName(titleLine, options);
   }
   const firstLine = titleLine.split("\n")[0] ?? "";
-  return titleIsRepresentable(firstLine) ? `${encodeTitleStem(carriedTitleSpelling(firstLine))}.md` : "Untitled.md";
+  const windows = options?.windows ?? process.platform === "win32";
+  if (titleIsRepresentable(firstLine, { windows })) {
+    return `${encodeTitleStem(carriedTitleSpelling(firstLine))}.md`;
+  }
+  if (windows && hasNonBmpCodePoint(carriedTitleSpelling(firstLine))) {
+    const projected = dropNonBmpAndJoiners(carriedTitleSpelling(firstLine)).replace(/\s+/g, " ").trim();
+    if (titleIsRepresentable(projected, { windows: true })) {
+      return `${encodeTitleStem(projected)}.md`;
+    }
+  }
+  return "Untitled.md";
 }
 
 /**
- * The note's real title when a file name can't carry it, for the caller to
- * record in `apple-note-title` frontmatter - and undefined whenever the name
- * is enough, which is nearly always.
+ * The note's real title when a file name can't carry it faithfully, for the
+ * caller to record in `apple-note-title` frontmatter - and undefined whenever
+ * the name is enough, which is nearly always.
  *
- * The exact complement of `noteFileNameFor`'s "Untitled.md" fallback: these
- * two answer the same question ("can the name hold this?") and must never
- * disagree, so they're kept side by side and both defer to
- * `titleIsRepresentable`.
+ * Complements `noteFileNameFor`: whenever this returns a title, that
+ * function filed a name that does not decode back to it ("Untitled.md", or
+ * on Windows a stem with supplementary-plane characters stripped). The two
+ * must never disagree about *whether* frontmatter is needed, so they stay
+ * side by side and both defer to `titleIsRepresentable`.
  */
-export function titleNeedingFrontmatter(titleLine: string, titleMode: "in-body" | "filename"): string | undefined {
+export function titleNeedingFrontmatter(
+  titleLine: string,
+  titleMode: "in-body" | "filename",
+  options?: TitlePlatformOptions,
+): string | undefined {
   if (titleMode !== "filename") {
     return undefined;
   }
@@ -42,7 +80,8 @@ export function titleNeedingFrontmatter(titleLine: string, titleMode: "in-body" 
   if (firstLine.trim() === "") {
     return undefined;
   }
-  return titleIsRepresentable(firstLine) ? undefined : firstLine;
+  const windows = options?.windows ?? process.platform === "win32";
+  return titleIsRepresentable(firstLine, { windows }) ? undefined : firstLine;
 }
 
 /**
@@ -59,8 +98,12 @@ export function titleNeedingFrontmatter(titleLine: string, titleMode: "in-body" 
  * from the name; whether the name is *acceptable* for the title always is,
  * and that's the question a rename decision actually asks.
  */
-export function fileNameCarriesTitle(fileName: string, titleLine: string): boolean {
-  const wanted = noteFileNameFor(titleLine, "filename");
+export function fileNameCarriesTitle(
+  fileName: string,
+  titleLine: string,
+  options?: TitlePlatformOptions,
+): boolean {
+  const wanted = noteFileNameFor(titleLine, "filename", options);
   if (fileName === wanted) {
     return true;
   }
@@ -81,22 +124,59 @@ export function fileNameCarriesTitle(fileName: string, titleLine: string): boole
 }
 
 /**
+ * A filesystem path segment derived from a title (or attachment stem).
+ * Destructive: illegal ASCII is deleted, whitespace collapsed, and on
+ * Windows supplementary-plane characters (most emoji) are dropped so Node
+ * can actually open the path. Empty after sanitizing - the caller picks
+ * "Untitled" / "Untitled Folder".
+ */
+export function sanitizeDisplayStem(title: string, options?: PathSanitizeOptions): string {
+  const windows = options?.windows ?? process.platform === "win32";
+  const maxLength = options?.maxLength ?? 80;
+  let slug = title.split("\n")[0] ?? "";
+  if (windows) {
+    slug = dropNonBmpAndJoiners(slug);
+  }
+  slug = slug
+    .replace(/[\\/:*?"<>|]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    // Leftover C0 / DEL after whitespace collapse. Tabs and newlines already
+    // became spaces; the rest (e.g. U+0001) are illegal on Windows and never
+    // useful in a path.
+    .replace(/[\u0000-\u001F\u007F]/g, "");
+  slug = [...slug].slice(0, maxLength).join("");
+  if (options?.stripTrailingDotSpace) {
+    slug = slug.replace(/[. ]+$/, "");
+  }
+  return slug;
+}
+
+/**
  * Derives a human-readable file name for a note from its title alone. The
  * CloudKit recordName that used to be suffixed onto every file for
  * uniqueness now lives only in .icloud-md/state.json (keyed by
  * recordName, with a `file` pointer back to disk) - see uniqueFileName for
  * how title collisions are disambiguated instead.
  */
-export function noteFileName(title: string): string {
-  const firstLine = title.split("\n")[0]?.trim() ?? "";
-  const slug = firstLine
-    .replace(/[\\/:*?"<>|]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80);
+export function noteFileName(title: string, options?: PathSanitizeOptions): string {
+  const slug = sanitizeDisplayStem(title, options);
   const base = slug.length > 0 ? slug : "Untitled";
-
   return `${base}.md`;
+}
+
+/**
+ * An attachment's on-disk basename: same character rules as a folder name
+ * (including the Windows non-BMP strip), extension preserved. Already-tracked
+ * attachment paths are not re-derived; this is only for new files.
+ */
+export function sanitizeAttachmentFileName(fileName: string, options?: PathSanitizeOptions): string {
+  const ext = path.extname(fileName);
+  const rawStem = fileName.slice(0, fileName.length - ext.length);
+  const stem = sanitizeDisplayStem(rawStem, { ...options, stripTrailingDotSpace: true });
+  const safeExt = ext.replace(/[\\/:*?"<>|\u0000-\u001F\u007F]/g, "");
+  const base = stem.length > 0 ? stem : "Untitled";
+  return `${base}${safeExt}`;
 }
 
 /**

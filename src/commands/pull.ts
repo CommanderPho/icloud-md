@@ -315,15 +315,16 @@ export async function runPull(
         }
 
         // decoded.status === "ok"
-        // The rare note whose title a file name genuinely can't hold: it is
-        // filed as "Untitled.md" and its real title recorded in
-        // frontmatter. Undefined for everything else, which is what
+        // The rare note whose title a file name genuinely can't hold: its
+        // real title is recorded in frontmatter. Most of those land at
+        // "Untitled.md"; on Windows an emoji title may still get a readable
+        // stripped name. Undefined for everything else, which is what
         // *removes* the key from a note that has just been retitled to
         // something a name can carry after all.
         const recordedTitle = titleNeedingFrontmatter(decoded.titleLine, titleMode);
-        // The changelist line already shows the "Untitled.md" this landed at,
-        // which is baffling on its own - the note isn't untitled. Say where
-        // its real title went, and why it had to go there.
+        // The changelist line already shows the file this landed at, which
+        // is baffling when that name isn't the title. Say where the real
+        // title went, and why it had to go there.
         const titleRemarks: PullChangeRemark[] =
           recordedTitle === undefined
             ? []

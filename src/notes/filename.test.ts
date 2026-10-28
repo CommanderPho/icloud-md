@@ -8,9 +8,14 @@ import {
   fileNameCarriesTitle,
   noteFileName,
   noteFileNameFor,
+  sanitizeAttachmentFileName,
+  sanitizeDisplayStem,
   titleNeedingFrontmatter,
   uniqueFileName,
 } from "./filename.js";
+
+const KAYLA_TITLE = "📚🖥Kayla's Old rMBP Pro ►Info (Retina, 13-inch, Early 2015)";
+const KAYLA_WINDOWS_STEM = "Kayla's Old rMBP Pro ►Info (Retina, 13-inch, Early 2015)";
 
 test("noteFileName derives a plain name from the title's first line", () => {
   assert.equal(noteFileName("Grocery list\nmilk, eggs"), "Grocery list.md");
@@ -22,6 +27,61 @@ test("noteFileName falls back to Untitled for an empty title", () => {
 
 test("noteFileName strips characters that are unsafe in file names", () => {
   assert.equal(noteFileName("a/b:c*d?e\"f<g>h|i"), "abcdefghi.md");
+});
+
+test("noteFileName strips leftover control characters on every platform", () => {
+  assert.equal(noteFileName("foo\u0001bar"), "foobar.md");
+});
+
+test("noteFileName on Windows drops supplementary-plane emoji and keeps BMP", () => {
+  assert.equal(noteFileName(KAYLA_TITLE, { windows: true }), `${KAYLA_WINDOWS_STEM}.md`);
+  assert.equal(noteFileName("Café ☕ notes", { windows: true }), "Café ☕ notes.md");
+  assert.equal(noteFileName("👨‍👩‍👧‍👦", { windows: true }), "Untitled.md");
+});
+
+test("noteFileName on POSIX keeps supplementary-plane emoji", () => {
+  assert.equal(noteFileName(KAYLA_TITLE, { windows: false }), `${KAYLA_TITLE}.md`);
+  assert.equal(noteFileName("emoji 👨‍👩‍👧‍👦 family", { windows: false }), "emoji 👨‍👩‍👧‍👦 family.md");
+});
+
+test("sanitizeDisplayStem on Windows does not leave ZWJ or variation selectors behind", () => {
+  assert.equal(sanitizeDisplayStem("x👨‍👩‍👧‍👦y", { windows: true }), "xy");
+  assert.equal(sanitizeDisplayStem("x🖥️y", { windows: true }), "xy");
+});
+
+test("sanitizeDisplayStem slices by code point so it does not split a surrogate pair", () => {
+  const title = `${"a".repeat(79)}📚`;
+  assert.equal([...sanitizeDisplayStem(title, { windows: false, maxLength: 80 })].length, 80);
+  assert.equal(sanitizeDisplayStem(title, { windows: false, maxLength: 80 }).endsWith("📚"), true);
+});
+
+test("filename mode on Windows files an emoji title under a stripped stem plus frontmatter", () => {
+  const opts = { windows: true as const };
+  assert.equal(noteFileNameFor(KAYLA_TITLE, "filename", opts), `${KAYLA_WINDOWS_STEM}.md`);
+  assert.equal(titleNeedingFrontmatter(KAYLA_TITLE, "filename", opts), KAYLA_TITLE);
+  assert.equal(fileNameCarriesTitle(`${KAYLA_WINDOWS_STEM}.md`, KAYLA_TITLE, opts), true);
+  assert.equal(fileNameCarriesTitle(`${KAYLA_WINDOWS_STEM} 2.md`, KAYLA_TITLE, opts), true);
+});
+
+test("filename mode on Windows falls back to Untitled when stripping leaves nothing usable", () => {
+  const opts = { windows: true as const };
+  assert.equal(noteFileNameFor("📚🖥", "filename", opts), "Untitled.md");
+  assert.equal(titleNeedingFrontmatter("📚🖥", "filename", opts), "📚🖥");
+  assert.equal(noteFileNameFor("📚CON", "filename", opts), "Untitled.md");
+  assert.equal(titleNeedingFrontmatter("📚CON", "filename", opts), "📚CON");
+});
+
+test("filename mode on POSIX keeps emoji in the name and skips frontmatter", () => {
+  const opts = { windows: false as const };
+  assert.equal(noteFileNameFor("emoji 👨‍👩‍👧‍👦 family", "filename", opts), "emoji 👨‍👩‍👧‍👦 family.md");
+  assert.equal(titleNeedingFrontmatter("emoji 👨‍👩‍👧‍👦 family", "filename", opts), undefined);
+});
+
+test("sanitizeAttachmentFileName keeps the extension and Windows-strips the stem", () => {
+  assert.equal(sanitizeAttachmentFileName("📚photo.jpg", { windows: true }), "photo.jpg");
+  assert.equal(sanitizeAttachmentFileName("Café ☕.png", { windows: true }), "Café ☕.png");
+  assert.equal(sanitizeAttachmentFileName("📚.png", { windows: true }), "Untitled.png");
+  assert.equal(sanitizeAttachmentFileName("a/b:c.png", { windows: false }), "abc.png");
 });
 
 test("uniqueFileName returns the candidate unchanged when it's free", () => {

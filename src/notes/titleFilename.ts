@@ -10,7 +10,10 @@
  *  - **Windows**: `\ / : * ? " < > |` are illegal, a trailing `.` or space
  *    is silently stripped, and the DOS device names (`CON`, `PRN`, `AUX`,
  *    `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`) are reserved even *with* an
- *    extension - `CON.md` is still reserved.
+ *    extension - `CON.md` is still reserved. Supplementary-plane characters
+ *    (most emoji) also cannot be stored in a path on some Node versions
+ *    (libuv WTF-8, Node 20.4-20.11): those titles are unrepresentable here
+ *    and the caller writes a BMP-stripped name plus `apple-note-title`.
  *  - **macOS**: `/` is illegal and `:` is hostile (the Finder still shows it
  *    as a path separator in places).
  *  - **Obsidian**, which is the point of the mode: `#`, `^`, `[` and `]` are
@@ -135,6 +138,12 @@ export function decodeTitleStem(stem: string): string {
   return out;
 }
 
+/** Options that pin path rules to a platform so tests are host-independent.
+ * `windows` defaults to `process.platform === "win32"`. */
+export interface TitlePlatformOptions {
+  windows?: boolean;
+}
+
 /**
  * Whether a file name can carry this title on its own. False means the
  * caller must record the title in `apple-note-title` frontmatter, because
@@ -143,14 +152,14 @@ export function decodeTitleStem(stem: string): string {
  * Note what is *not* here: illegal characters. Homoglyph substitution makes
  * those representable, which is most of why the frontmatter key stays rare.
  */
-export function titleIsRepresentable(title: string): boolean {
-  return representabilityProblem(title) === undefined;
+export function titleIsRepresentable(title: string, options?: TitlePlatformOptions): boolean {
+  return representabilityProblem(title, options) === undefined;
 }
 
 /** Why a title can't be carried by a file name, or undefined when it can.
  * Exported for the pull report, so a note that gains an `apple-note-title`
  * can say why. */
-export function representabilityProblem(title: string): string | undefined {
+export function representabilityProblem(title: string, options?: TitlePlatformOptions): string | undefined {
   if (title.trim() === "") {
     return "the title is empty";
   }
@@ -173,7 +182,39 @@ export function representabilityProblem(title: string): string | undefined {
   if (RESERVED_DEVICE_NAMES.has(carried.toUpperCase())) {
     return "the title is a reserved device name on Windows";
   }
+  const windows = options?.windows ?? process.platform === "win32";
+  if (windows && hasNonBmpCodePoint(carried)) {
+    // Node 20.4-20.11 on Windows reports ENOENT for supplementary-plane
+    // characters in a path (libuv WTF-8). NTFS allows them; the I/O APIs
+    // this process uses do not, on those versions.
+    return "the title contains characters that cannot be stored in a file name on Windows";
+  }
   return undefined;
+}
+
+/** True when `s` contains a code point outside the BMP (most emoji). */
+export function hasNonBmpCodePoint(s: string): boolean {
+  for (const character of s) {
+    if ((character.codePointAt(0) ?? 0) > 0xffff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Drops supplementary-plane characters plus the ZWJ / variation selectors
+ * that would otherwise be left behind as invisible junk after an emoji
+ * sequence is stripped (`👨‍👩‍👧‍👦`, `🖥️`). */
+export function dropNonBmpAndJoiners(s: string): string {
+  let out = "";
+  for (const character of s) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint > 0xffff || codePoint === 0x200d || codePoint === 0xfe0e || codePoint === 0xfe0f) {
+      continue;
+    }
+    out += character;
+  }
+  return out;
 }
 
 /**

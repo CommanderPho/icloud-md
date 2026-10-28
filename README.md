@@ -109,7 +109,7 @@ This puts the `icloud-md` command on your `PATH`.
 Building from a clone of this repo instead:
 
 ```bash
-git clone https://github.com/coddingtonbear/icloud-md.git
+git clone https://github.com/CommanderPho/icloud-md.git
 cd icloud-md
 npm install
 npm run build && npm link
@@ -377,6 +377,13 @@ A few consequences worth knowing before you pick:
   no name can carry at all (extremely long, leading dot, a reserved name
   like `CON`) is filed as `Untitled.md` with the real title recorded in
   `apple-note-title` frontmatter, and `pull` says so on the changelist line.
+  On Windows, supplementary-plane emoji (most of them: 📚, 🖥, family
+  ZWJ sequences, …) are omitted from **file and folder names** — Node 20.4–
+  20.11 cannot open those paths at all — while BMP characters such as ☕
+  stay. The title itself is unchanged: it remains the first line of the
+  file (in-body vaults), or in `apple-note-title` under
+  `--filename-as-title` (the file then uses the emoji-stripped stem rather
+  than `Untitled.md`, unless stripping leaves nothing usable).
 - **`apple-note-title` also works in the other direction.** Setting it on a
   note asks for that title, which is the only way to give a note a title no
   file name could spell. `push` sends the retitle; the file itself is
@@ -416,6 +423,11 @@ integration never gets to it.
 
 ## Known limitations
 
+- **Windows file and folder names drop supplementary-plane emoji.** NTFS
+  allows them, but Node 20.4–20.11 reports `ENOENT` on any path that
+  contains one (a libuv WTF-8 bug). Names are projected to the BMP so
+  clone and pull can write the file; the note's title is not rewritten.
+  macOS and Linux keep emoji in names. See [Where the title lives](#where-the-title-lives).
 - **Regular file attachments (images, audio, other files) are permanently
   read-only** `push` will always refuse to write back
   a note that has a non-table attachment, since this tool doesn't fully

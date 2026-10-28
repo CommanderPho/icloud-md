@@ -66,6 +66,20 @@ test("emoji and non-Latin scripts pass through untouched", () => {
   }
 });
 
+test("a BMP emoji title is representable even on Windows", () => {
+  assert.ok(titleIsRepresentable("Café ☕ notes", { windows: true }));
+  assert.equal(representabilityProblem("Café ☕ notes", { windows: true }), undefined);
+});
+
+test("a supplementary-plane emoji title is not representable on Windows", () => {
+  assert.ok(!titleIsRepresentable("emoji 👨‍👩‍👧‍👦 family", { windows: true }));
+  assert.match(
+    representabilityProblem("emoji 👨‍👩‍👧‍👦 family", { windows: true }) ?? "",
+    /cannot be stored in a file name on Windows/,
+  );
+  assert.ok(titleIsRepresentable("emoji 👨‍👩‍👧‍👦 family", { windows: false }));
+});
+
 // --- representability --------------------------------------------------------
 
 test("an ordinary title is representable, illegal characters and all", () => {

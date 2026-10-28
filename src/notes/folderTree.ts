@@ -1,5 +1,6 @@
 import type { CloudKitRecord } from "../cloudkit/databaseClient.js";
 import { TRASH_FOLDER_RECORD_NAME } from "./encodeNoteRecord.js";
+import { sanitizeDisplayStem, type PathSanitizeOptions } from "./filename.js";
 
 /** The account's default "Notes" folder - a real Folder record like any
  * other, just with a well-known name (confirmed live 2026-07-16, title
@@ -93,16 +94,10 @@ function parentFolderReference(record: CloudKitRecord): string | undefined {
 }
 
 /** Same character rules as note file names, minus the extension; folders
- * with no usable title become "Untitled Folder". */
-export function sanitizeFolderDirName(title: string): string {
-  const firstLine = title.split("\n")[0]?.trim() ?? "";
-  const slug = firstLine
-    .replace(/[\\/:*?"<>|]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80)
-    // A trailing dot or space is invalid on Windows and confusing anywhere.
-    .replace(/[. ]+$/, "");
+ * with no usable title become "Untitled Folder". A trailing dot or space
+ * is stripped (invalid on Windows and confusing anywhere). */
+export function sanitizeFolderDirName(title: string, options?: PathSanitizeOptions): string {
+  const slug = sanitizeDisplayStem(title, { ...options, stripTrailingDotSpace: true });
   return slug.length > 0 ? slug : "Untitled Folder";
 }
 
