@@ -1,3 +1,7 @@
 {
-    "git.ignoreLimitWarning": true
+  "git.ignoreLimitWarning": true,
+  "files.exclude": {
+    "**lolinternets-icloud": true,
+    "**my-notes": true
+  }
 }
