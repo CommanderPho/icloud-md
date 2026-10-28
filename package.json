@@ -69,5 +69,9 @@
     "remark-stringify": "^11.0.0",
     "unified": "^11.0.5",
     "yaml": "^2.9.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "@bufbuild/buf@1.71.0": true
   }
 }
