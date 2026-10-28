@@ -5,7 +5,11 @@
 		},
 		{
 			"name": "Config",
-			"path": "~/.config/icloud-md"
+			"path": "~/.config/icloud-md" // Unix
+		},
+		{
+			"name": "Config",
+			"path": "C:/Users/pho/.config/icloud-md" // Windows
 		}
 	],
 	"settings": {
